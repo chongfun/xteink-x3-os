@@ -1,6 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod anchor;
 pub mod book;
 pub mod cache;
 pub mod captive;
