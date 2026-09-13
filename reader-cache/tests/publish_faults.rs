@@ -1073,7 +1073,7 @@ fn evicting_pagination_leaves_the_place_alone() {
 
     let id = book_id(11);
     let anchor = proto::anchor::ContentAnchor::at(2, 900);
-    files::write_place(&root, id, anchor, SOURCE, 0).expect("the place stores");
+    files::write_place(&root, id, anchor, source(), Some(0)).expect("the place stores");
 
     let layout = write_section_under(&root, &mut store, false, 0);
     assert!(files::empty_layout_cache(&root, KEY, layout));
@@ -1085,9 +1085,14 @@ fn evicting_pagination_leaves_the_place_alone() {
     );
 }
 
-/// The source a test writes its places against, which is IDENTITY unless a
-/// test is about the bytes changing.
-const SOURCE: (u32, u32) = IDENTITY;
+/// The content a test writes its places against: a length, and no recorded
+/// hash unless the test is about one.
+fn source() -> proto::nvm::PlaceSource {
+    proto::nvm::PlaceSource {
+        byte_size: IDENTITY.1,
+        digest: None,
+    }
+}
 
 fn place_anchor(
     root: &Dir<'_>,
@@ -1102,6 +1107,69 @@ fn book_id(seed: u8) -> proto::identity::BookId {
 
 /// The whole point of the format: a place belongs to the copy, so it is
 /// legible after anything that used to lose it.
+/// The case the anchor exists for, and the one a locator-derived source
+/// identity would have thrown away: a proven move keeps the copy's id and
+/// changes nothing about its content, so the place stays exact.
+#[test]
+fn a_move_leaves_a_place_exact() {
+    let was = proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+        digest: Some([7u8; 32]),
+    };
+    // Same bytes, somewhere else on the card. Nothing about content moved.
+    let moved = was;
+    assert!(was.describes(&moved), "a move is not a source change");
+
+    // A different edition of the same length, read, so both sides have a
+    // hash to compare.
+    let replaced = proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+        digest: Some([9u8; 32]),
+    };
+    assert!(
+        !was.describes(&replaced),
+        "a same-length replacement is caught by the recorded bytes"
+    );
+
+    // Neither side read: the library identity PRD's R4 accepts this, because
+    // nothing on the device can tell the two apart.
+    let unread = proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+        digest: None,
+    };
+    assert!(unread.describes(&proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+        digest: None,
+    }));
+    assert!(
+        !unread.describes(&proto::nvm::PlaceSource {
+            byte_size: 9_000_000,
+            digest: None,
+        }),
+        "and a different length settles it without any hash"
+    );
+}
+
+/// A place with no trustworthy fraction is still a place. The anchor is the
+/// valuable half and it is exact; the progression is the guess for a source
+/// that changed.
+#[test]
+fn a_place_stores_its_anchor_before_it_knows_the_books_length() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(31);
+    let anchor = proto::anchor::ContentAnchor::at(6, 1_200);
+
+    files::write_place(&root, id, anchor, source(), None).expect("the place stores");
+    let place = files::read_place(&root, id).expect("it reads back");
+    assert_eq!(place.anchor, anchor, "the anchor is there");
+    assert_eq!(
+        place.progression, None,
+        "and the fraction is honestly absent"
+    );
+}
+
 /// R13 and R15: a place written against other bytes keeps its progression,
 /// and says plainly that the anchor is no longer evidence.
 #[test]
@@ -1114,23 +1182,28 @@ fn a_place_survives_a_replacement_without_claiming_to_be_exact() {
     // Two thirds of the way through: the part of a place that survives an edit.
     let progression = (u16::MAX / 3) * 2;
 
-    files::write_place(&root, id, anchor, SOURCE, progression).expect("the place stores");
+    files::write_place(&root, id, anchor, source(), Some(progression)).expect("the place stores");
     let place = files::read_place(&root, id).expect("it reads back");
     assert!(
-        place.describes(SOURCE),
+        place.describes(&source()),
         "against the bytes it was written for"
     );
     assert_eq!(place.anchor, anchor, "so the anchor is exact");
 
-    // A managed replacement keeps the id and changes the bytes.
-    let replaced = (SOURCE.0 ^ 0x5555_5555, SOURCE.1 + 4_096);
+    // A managed replacement keeps the id and changes the bytes, which shows
+    // up in the length whatever else it changes.
+    let replaced = proto::nvm::PlaceSource {
+        byte_size: IDENTITY.1 + 4_096,
+        digest: None,
+    };
     assert!(
-        !place.describes(replaced),
+        !place.describes(&replaced),
         "the same place against other bytes is a guess"
     );
     assert_eq!(
-        place.progression, progression,
-        "and the progression is what the guess is made from"
+        place.progression,
+        Some(progression),
+        "and the guess is made from the progression"
     );
     assert_eq!(
         place.id, id,
@@ -1147,7 +1220,7 @@ fn a_place_belongs_to_the_copy_rather_than_to_a_file() {
     let anchor = proto::anchor::ContentAnchor::at(3, 4_096);
 
     assert_eq!(place_anchor(&root, id), None, "nothing stored yet");
-    files::write_place(&root, id, anchor, SOURCE, 0).expect("the place stores");
+    files::write_place(&root, id, anchor, source(), Some(0)).expect("the place stores");
     assert_eq!(place_anchor(&root, id), Some(anchor));
 
     // Nothing about where the book's file sits reached that write, so nothing
@@ -1155,7 +1228,8 @@ fn a_place_belongs_to_the_copy_rather_than_to_a_file() {
     let twin = book_id(9);
     assert_eq!(place_anchor(&root, twin), None, "a twin starts fresh");
     let twin_anchor = proto::anchor::ContentAnchor::at(0, 12);
-    files::write_place(&root, twin, twin_anchor, SOURCE, 0).expect("the twin stores its own");
+    files::write_place(&root, twin, twin_anchor, source(), Some(0))
+        .expect("the twin stores its own");
     assert_eq!(
         place_anchor(&root, id),
         Some(anchor),
@@ -1172,7 +1246,7 @@ fn a_place_is_rewritten_in_place_and_survives_the_write() {
     let id = book_id(4);
     for page in 0..6u32 {
         let anchor = proto::anchor::ContentAnchor::at(1, page * 700);
-        files::write_place(&root, id, anchor, SOURCE, 0).expect("saves");
+        files::write_place(&root, id, anchor, source(), Some(0)).expect("saves");
         assert_eq!(
             place_anchor(&root, id),
             Some(anchor),
@@ -1188,8 +1262,8 @@ fn a_place_from_another_content_stream_is_not_believed() {
     let mut bytes = proto::nvm::PlaceRecord {
         id: book_id(2),
         anchor: proto::anchor::ContentAnchor::at(5, 50),
-        source: SOURCE,
-        progression: 0,
+        source: source(),
+        progression: Some(0),
     }
     .encode();
     assert!(proto::nvm::PlaceRecord::decode(&bytes).is_some());
@@ -1203,8 +1277,8 @@ fn a_place_from_another_content_stream_is_not_believed() {
     let mut torn = proto::nvm::PlaceRecord {
         id: book_id(2),
         anchor: proto::anchor::ContentAnchor::at(5, 50),
-        source: SOURCE,
-        progression: 0,
+        source: source(),
+        progression: Some(0),
     }
     .encode();
     torn[12] ^= 0xFF;

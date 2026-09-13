@@ -1218,6 +1218,11 @@ impl ReaderStore {
         self.page_anchor(usize::try_from(within).ok()?)
     }
 
+    /// How many sections the resident index describes.
+    pub fn book_section_count(&self) -> usize {
+        self.book_section_count
+    }
+
     /// One record from the book index.
     pub fn book_section(&self, index: usize) -> Option<BookV2SectionRecord> {
         (index < self.book_section_count).then(|| self.book_sections[index])

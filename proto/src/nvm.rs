@@ -399,6 +399,44 @@ impl PositionRecord {
     }
 }
 
+/// What a place was written against, for deciding whether its anchor still
+/// describes the book.
+///
+/// Content, not location. A move changes where a copy sits and changes
+/// nothing about what it holds, and the anchor is the thing that is supposed
+/// to survive a move, so anything path-derived here would throw away exactly
+/// the case the record exists for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaceSource {
+    /// The file's length. Move-invariant and cheap, and a replacement of a
+    /// different length is caught by it alone.
+    pub byte_size: u32,
+    /// The hash recorded for this copy, when one has been read. Absent for a
+    /// copy nobody has read yet, which the library identity PRD's R4 accepts:
+    /// a same-sized replacement of a copy with no recorded bytes cannot be
+    /// told from the original by anything the device holds.
+    pub digest: Option<[u8; 32]>,
+}
+
+impl PlaceSource {
+    /// Whether a place written against `self` still describes `now`.
+    ///
+    /// Length first, since it settles most replacements and costs nothing.
+    /// Then the recorded hashes, which settle the same-length replacement
+    /// when both sides have been read. Two absent hashes read as the same
+    /// source, by the same rule that lets a copy be adopted without reading
+    /// it.
+    pub fn describes(&self, now: &Self) -> bool {
+        if self.byte_size != now.byte_size {
+            return false;
+        }
+        match (self.digest, now.digest) {
+            (Some(was), Some(is)) => was == is,
+            _ => true,
+        }
+    }
+}
+
 /// A reader's place in one library copy, addressed by the copy rather than by
 /// where its file sits.
 ///
@@ -416,29 +454,24 @@ pub struct PlaceRecord {
     /// caught rather than silently handing one book another's place.
     pub id: crate::identity::BookId,
     pub anchor: crate::anchor::ContentAnchor,
-    /// The source the anchor was resolved against: the cheap per-file
-    /// identity, hash and byte size, that the reader has without hashing
-    /// anything.
-    ///
-    /// Here so a source change is detectable without making the source own
-    /// the place. An offset that still resolves proves nothing about what it
-    /// points at: insert a thousand characters early in a chapter and the old
-    /// offset stays valid and means something else.
-    pub source: (u32, u32),
-    /// How far through the book the reader was, as sixteenths of thousandths
-    /// of the way: 0 at the start, `u16::MAX` at the end.
+    /// What the anchor was resolved against, so a source change is detectable
+    /// without making the source own the place.
+    pub source: PlaceSource,
+    /// How far through the book the reader was, as a fraction of `u16::MAX`,
+    /// or `None` while no complete pagination has said how long the book is.
     ///
     /// Fallback, not authority: read only when the source changed under the
-    /// copy, where landing nearby beats landing at page one. Ignored entirely
-    /// while the source still matches.
-    pub progression: u16,
+    /// copy. `None` rather than a fraction of a half-built book, because a
+    /// page total from a partial index is a floor and dividing by it would
+    /// call page 10 of an eventual 200 the halfway mark.
+    pub progression: Option<u16>,
 }
 
 impl PlaceRecord {
-    pub const ENCODED_LEN: usize = 42;
+    pub const ENCODED_LEN: usize = 75;
     const MAGIC: &'static [u8; 4] = b"X4PL";
     const VERSION: u8 = 1;
-    const CHECKSUM_AT: usize = 38;
+    const CHECKSUM_AT: usize = 71;
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -449,19 +482,24 @@ impl PlaceRecord {
         let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
         self.anchor.encode(&mut anchor);
         out[22..28].copy_from_slice(&anchor);
-        out[28..32].copy_from_slice(&self.source.0.to_le_bytes());
-        out[32..36].copy_from_slice(&self.source.1.to_le_bytes());
-        out[36..38].copy_from_slice(&self.progression.to_le_bytes());
+        out[28..32].copy_from_slice(&self.source.byte_size.to_le_bytes());
+        if let Some(digest) = self.source.digest {
+            out[32] = 1;
+            out[33..65].copy_from_slice(&digest);
+        }
+        if let Some(progression) = self.progression {
+            out[65] = 1;
+            out[66..68].copy_from_slice(&progression.to_le_bytes());
+        }
         let sum = checksum(&out[..Self::CHECKSUM_AT]);
         out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
         out
     }
 
-    /// Whether this place was written against the source a reader is holding
-    /// now. False means the bytes changed under the copy, which demotes the
-    /// anchor to a guess and leaves [`progression`](Self::progression).
-    pub fn describes(&self, source: (u32, u32)) -> bool {
-        self.source == source
+    /// Whether this place was written against the bytes a reader is holding
+    /// now. False demotes the anchor to a guess.
+    pub fn describes(&self, source: &PlaceSource) -> bool {
+        self.source.describes(source)
     }
 
     /// `None` for anything this build cannot read as a place: another magic,
@@ -485,14 +523,19 @@ impl PlaceRecord {
         id.copy_from_slice(&bytes[6..22]);
         let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
         anchor.copy_from_slice(&bytes[22..28]);
+        let digest = (bytes[32] == 1).then(|| {
+            let mut sha = [0u8; 32];
+            sha.copy_from_slice(&bytes[33..65]);
+            sha
+        });
         Some(Self {
             id: crate::identity::BookId::from_bytes(id)?,
             anchor: crate::anchor::ContentAnchor::decode(&anchor),
-            source: (
-                u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
-                u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
-            ),
-            progression: u16::from_le_bytes([bytes[36], bytes[37]]),
+            source: PlaceSource {
+                byte_size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+                digest,
+            },
+            progression: (bytes[65] == 1).then(|| u16::from_le_bytes([bytes[66], bytes[67]])),
         })
     }
 }

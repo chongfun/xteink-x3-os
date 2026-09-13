@@ -69,6 +69,11 @@ static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+/// How many times an open will build further to pin down a stored place.
+/// Each step covers at least one more section, and the bound stops a book
+/// whose index refuses to grow from holding the open open.
+const PLACE_RESOLVE_STEPS: usize = 8;
+
 #[embassy_executor::task]
 pub async fn run(
     mut epd: Epd,
@@ -1567,15 +1572,28 @@ fn handle_storage_command(
                         // The index now describes this book under this
                         // layout, which is the first moment a stored place
                         // can be turned into a page.
+                        //
+                        // A progressive build stops once it covers the page
+                        // it was asked for, and the page a place names is not
+                        // known until the pagination holding it exists, so
+                        // the two take turns: resolve, build further, resolve
+                        // again. Bounded, because a book whose index refuses
+                        // to grow must not hold the open open.
                         if let Some(place) = pending_place.take() {
-                            if let Some(target) = book_build::resolve_place(
-                                epd,
-                                sd_cs,
-                                sd_library,
-                                index as usize,
-                                place,
-                            ) {
-                                if !sd_library.covers_global_page(index as usize, target) {
+                            for _ in 0..PLACE_RESOLVE_STEPS {
+                                let target = book_build::resolve_place(
+                                    epd,
+                                    sd_cs,
+                                    sd_library,
+                                    index as usize,
+                                    place,
+                                );
+                                let (page, again) = match target {
+                                    book_build::PlaceTarget::Keep => break,
+                                    book_build::PlaceTarget::Page(page) => (page, false),
+                                    book_build::PlaceTarget::Extend(page) => (page, true),
+                                };
+                                if !sd_library.covers_global_page(index as usize, page) {
                                     let scratch = ensure_epub_scratch(epub_scratch);
                                     let outcome = book_build::build_or_load_book_cache(
                                         epd,
@@ -1583,14 +1601,22 @@ fn handle_storage_command(
                                         sd_library,
                                         index as usize,
                                         chapter,
-                                        target as usize,
+                                        page as usize,
                                         scratch,
                                         font_metrics,
                                     );
                                     apply_build_outcome(background_build, outcome, book_id);
                                     section_loaded = Some(false);
                                 }
-                                open.resolve_place(target);
+                                if !again {
+                                    open.resolve_place(page);
+                                    break;
+                                }
+                                // Nothing new was built, so asking again
+                                // would ask the same question forever.
+                                if sd_library.advertised_page_count() <= page {
+                                    break;
+                                }
                             }
                         }
                         open.section_loaded();

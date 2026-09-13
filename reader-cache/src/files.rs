@@ -271,22 +271,51 @@ pub enum PlaceDenied {
     Taken,
 }
 
+/// What a place should record as the source it was resolved against.
+///
+/// The copy's length, plus the hash recorded for it if the background read
+/// has reached it. Both are content: a move changes where the file sits and
+/// changes neither of these, which is the whole point of storing them rather
+/// than the locator-derived cache identity.
+pub fn place_source_for<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    byte_size: u32,
+) -> proto::nvm::PlaceSource
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    proto::nvm::PlaceSource {
+        byte_size,
+        digest: recorded_evidence(root, owner)
+            .and_then(|evidence| evidence.digest)
+            .map(|digest| *digest.sha256()),
+    }
+}
+
 /// Store where a reader left off in one copy.
 ///
 /// The anchor is content, so this survives every layout change and every move
 /// of the file. What it does not survive is the copy being forgotten, which
 /// is the point: a place belongs to a `BookId`.
 ///
-/// `source` is the cheap identity of the file the anchor was resolved
-/// against, and `progression` how far through the book the reader was. The
-/// first says whether the anchor still means what it meant; the second is
-/// what a changed source leaves to go on.
+/// `source` records the content the anchor was resolved against rather than
+/// the location, so a move leaves it alone. `progression` is how far through
+/// the book the reader was, and `None` while no complete pagination has said
+/// how long the book is.
 pub fn write_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     id: proto::identity::BookId,
     anchor: proto::anchor::ContentAnchor,
-    source: (u32, u32),
-    progression: u16,
+    source: proto::nvm::PlaceSource,
+    progression: Option<u16>,
 ) -> Result<(), PlaceDenied>
 where
     D: embedded_sdmmc::BlockDevice,
