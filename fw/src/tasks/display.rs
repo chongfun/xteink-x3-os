@@ -1447,6 +1447,9 @@ fn handle_storage_command(
             // close-out refused never gets that far and must not report an open
             // that did not happen.
             let mut section_loaded = None;
+            // Read at the saved-position step and spent at the section load,
+            // which is where a place first has a pagination to resolve in.
+            let mut pending_place: Option<book_build::SavedPlace> = None;
             loop {
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
@@ -1500,9 +1503,13 @@ fn handle_storage_command(
                         open.staged();
                     }
                     OpenAction::LoadSavedPosition { index } => {
-                        let saved =
-                            book_build::load_position(epd, sd_cs, sd_library, index as usize);
-                        open.saved_position(saved);
+                        // The place is read here and resolved after the load:
+                        // it names content, and which page that content falls
+                        // on is decided by the pagination this open is about
+                        // to build.
+                        pending_place =
+                            book_build::load_place(epd, sd_cs, sd_library, index as usize);
+                        open.saved_position(pending_place.map(book_build::SavedPlace::provisional));
                         if open.resumed() {
                             esp_println::println!(
                                 "storage: resume book {} at chapter {} screen {}",
@@ -1556,6 +1563,35 @@ fn handle_storage_command(
                                 font_metrics,
                             );
                             apply_build_outcome(background_build, outcome, book_id);
+                        }
+                        // The index now describes this book under this
+                        // layout, which is the first moment a stored place
+                        // can be turned into a page.
+                        if let Some(place) = pending_place.take() {
+                            if let Some(target) = book_build::resolve_place(
+                                epd,
+                                sd_cs,
+                                sd_library,
+                                index as usize,
+                                place,
+                            ) {
+                                if !sd_library.covers_global_page(index as usize, target) {
+                                    let scratch = ensure_epub_scratch(epub_scratch);
+                                    let outcome = book_build::build_or_load_book_cache(
+                                        epd,
+                                        sd_cs,
+                                        sd_library,
+                                        index as usize,
+                                        chapter,
+                                        target as usize,
+                                        scratch,
+                                        font_metrics,
+                                    );
+                                    apply_build_outcome(background_build, outcome, book_id);
+                                    section_loaded = Some(false);
+                                }
+                                open.resolve_place(target);
+                            }
                         }
                         open.section_loaded();
                     }
@@ -2378,7 +2414,12 @@ fn book_position(
     index: u16,
     mirror: AppStateRecord,
 ) -> (u16, u32) {
-    match book_build::load_position(epd, sd_cs, library, usize::from(index)) {
+    // The boot mirror only understands a page, so a place resolves to the
+    // chapter it names and page zero inside it. The open that follows refines
+    // it against the pagination it builds, the same way an ordinary open does.
+    match book_build::load_place(epd, sd_cs, library, usize::from(index))
+        .map(book_build::SavedPlace::provisional)
+    {
         Some(position) => position,
         None => {
             esp_println::println!(

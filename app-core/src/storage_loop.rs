@@ -531,56 +531,72 @@ impl OpenSequence {
                 ..
             } if named != catalog_epoch
         );
-        let (request_id, book_id, index, chapter, target_pages, type_settings, portrait, previous) =
-            match *command {
-                StorageCommand::OpenBook {
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    previous,
-                    catalog_epoch: _,
-                } => (
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    previous,
-                ),
-                // An extend stays inside the book already loaded and owes
-                // nothing to any other, so it carries no departing state and
-                // never resumes.
-                StorageCommand::ExtendSection {
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                } => (
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    None,
-                ),
-                _ => return None,
-            };
+        let (
+            request_id,
+            book_id,
+            index,
+            chapter,
+            target_pages,
+            type_settings,
+            portrait,
+            previous,
+            resolve_place,
+        ) = match *command {
+            StorageCommand::OpenBook {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                previous,
+                catalog_epoch: _,
+                resolve_place,
+            } => (
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                previous,
+                resolve_place,
+            ),
+            // An extend stays inside the book already loaded and owes
+            // nothing to any other, so it carries no departing state and
+            // never resumes.
+            StorageCommand::ExtendSection {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+            } => (
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                None,
+                false,
+            ),
+            _ => return None,
+        };
         if request_id != latest_request_id {
             return None;
         }
-        let resumable =
-            matches!(command, StorageCommand::OpenBook { .. }) && chapter == 0 && target_pages == 0;
+        // An open resolves the stored place when it says to, and when the
+        // app has no page to offer. The second is the book switch and the
+        // cold start; the first is the typography change, where the app has a
+        // page and the page means nothing.
+        let resumable = matches!(command, StorageCommand::OpenBook { .. })
+            && (resolve_place || (chapter == 0 && target_pages == 0));
         Some(Self {
             phase: match (fenced_out, previous) {
                 // Nothing has been touched yet, so the refusal is clean: the
@@ -697,18 +713,31 @@ impl OpenSequence {
         };
     }
 
-    /// The book's own saved position, if it had a usable one.
+    /// The book's own saved place, if it had a usable one.
+    ///
+    /// Adopted whatever it says, including the start of the book. The page
+    /// this open carried may have been counted under another layout, in which
+    /// case it names nothing here, so "the same as the request" is not a
+    /// reason to keep the request.
     pub fn saved_position(&mut self, position: Option<(u16, u32)>) {
         if let Some((chapter, screen)) = position {
-            // A saved start-of-book is indistinguishable from no saved position
-            // and needs no resume: the request already targets chapter 0 page 0.
-            if chapter > 0 || screen > 0 {
-                self.chapter = chapter;
-                self.page = screen.min(u16::MAX as u32) as u16;
-                self.resumed = true;
-            }
+            self.chapter = chapter;
+            self.page = screen.min(u16::MAX as u32) as u16;
+            self.resumed = chapter > 0 || screen > 0;
         }
         self.phase = OpenPhase::LoadSection;
+    }
+
+    /// The page a stored place resolved to, once the book was paginated for
+    /// this open's layout.
+    ///
+    /// Separate from [`saved_position`](Self::saved_position) because the two
+    /// happen at different times and cannot be merged: a place names content,
+    /// and the page that content falls on exists only after the pagination
+    /// this open builds.
+    pub fn resolve_place(&mut self, page: u32) {
+        self.page = page.min(u16::MAX as u32) as u16;
+        self.resumed |= self.page > 0 || self.chapter > 0;
     }
 
     /// The section covering the target page is resident.
@@ -802,6 +831,7 @@ mod tests {
             type_settings: SETTINGS,
             portrait: false,
             previous,
+            resolve_place: false,
         }
     }
 
@@ -960,6 +990,7 @@ mod tests {
             type_settings: TypeSettings::default(),
             portrait: false,
             previous: None,
+            resolve_place: false,
         }
     }
 

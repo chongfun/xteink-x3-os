@@ -415,6 +415,14 @@ pub enum StorageCommand {
         /// The departing book's final position, when this open changes books.
         /// `None` re-opens the book already active, which owes nothing.
         previous: Option<PersistedAppState>,
+        /// Resolve the copy's stored place rather than opening at the page
+        /// this command carries.
+        ///
+        /// Set when the app's page was counted under another layout, which a
+        /// typography change leaves behind: the number still reads like a
+        /// page and names content that moved. The place is content, so it
+        /// answers where the reader was in the pagination this open builds.
+        resolve_place: bool,
     },
     ExtendSection {
         request_id: u32,
@@ -1158,6 +1166,10 @@ pub fn open_book_command(
         type_settings: state.type_settings(),
         portrait: is_portrait(state.orientation),
         previous,
+        // The page in hand was counted under another layout, so it names
+        // nothing in the one this open adopts. The stored place is the only
+        // thing that still means where the reader was.
+        resolve_place: state.page_layout != state.layout_stamp(),
     }
 }
 
@@ -2204,6 +2216,11 @@ impl ReducerContext {
 pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
+    /// The layout `page` was counted under, so an open can tell whether the
+    /// number in hand still describes a pagination that exists. A settings
+    /// round trip back to where it started keeps its page: the stamp matches
+    /// again.
+    pub page_layout: u16,
     pub selection: u16,
     pub chapter: u16,
     pub book_id: u32,
@@ -2266,10 +2283,29 @@ pub struct ReaderState {
 }
 
 impl ReaderState {
+    /// Everything that moves a page boundary, packed into one number.
+    ///
+    /// Line spacing is in, unlike the pagination cache's own layout key: a
+    /// spacing change re-walks the same wrap points, which leaves the stored
+    /// pagination valid and still moves which page a given place falls on.
+    pub const fn layout_stamp(&self) -> u16 {
+        (self.font_family as u16)
+            | ((self.font_size as u16) << 3)
+            | ((self.font_weight as u16) << 6)
+            | ((self.line_spacing as u16) << 8)
+            | ((self.orientation as u16) << 11)
+    }
+
+    /// Record that `page` was counted under the settings in hand.
+    pub const fn stamp_page_layout(&mut self) {
+        self.page_layout = self.layout_stamp();
+    }
+
     pub const fn boot() -> Self {
         Self {
             view: AppView::Home,
             page: 0,
+            page_layout: 0,
             selection: 0,
             chapter: 0,
             book_id: 1,
@@ -2711,6 +2747,7 @@ impl ReaderState {
                     self.book_id = ReaderSource::sd(0).book_id();
                     self.chapter = 0;
                     self.page = 0;
+                    self.stamp_page_layout();
                     self.dirty = Rect::FULL;
                 }
                 if self.view == AppView::Library {
@@ -2753,6 +2790,9 @@ impl ReaderState {
                     self.page = position
                         .unwrap_or(self.page)
                         .min(self.sd_page_count.saturating_sub(1));
+                    // Counted under the settings this open ran with, which is
+                    // what makes the number comparable later.
+                    self.stamp_page_layout();
                     // The firmware owns the true current chapter over the whole
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
@@ -2881,6 +2921,7 @@ impl ReaderState {
                     self.chapter = 0;
                     self.selection = 0;
                     self.page = 0;
+                    self.stamp_page_layout();
                     self.sd_page_count = 1;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
@@ -5483,6 +5524,77 @@ mod tests {
     /// for: it closes out nobody, so the older reading of "can this abort"
     /// said no, while the catalog fence could refuse it all the same. What
     /// followed was worse than a bad screen. The reader stayed in Reading
+    fn resolves_place(command: &StorageCommand) -> bool {
+        matches!(
+            command,
+            StorageCommand::OpenBook {
+                resolve_place: true,
+                ..
+            }
+        )
+    }
+
+    /// The flow the place record exists for. Read to a page, change the type
+    /// size, come back: the page in hand was counted under a pagination that
+    /// no longer exists, so the open has to resolve the stored place instead
+    /// of opening at a number that now names other content.
+    #[test]
+    fn a_typography_change_makes_the_next_open_resolve_the_stored_place() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        assert!(
+            !resolves_place(&open_book_command(&state, 0, 1, None, None)),
+            "nothing has changed, so the page in hand still counts"
+        );
+
+        state.selection = 1;
+        state.view = AppView::Settings;
+        let changed = apply_setting(state);
+        assert_ne!(
+            changed.font_size, state.font_size,
+            "the fixture changed one"
+        );
+        assert_eq!(changed.page, 120, "the app still holds the old number");
+        assert!(
+            resolves_place(&open_book_command(&changed, 0, 1, None, None)),
+            "and the open must not open at it"
+        );
+    }
+
+    /// Spacing moves page boundaries without moving wrap points, so the
+    /// pagination cache keeps one copy for both and the page number still
+    /// changes. The open has to resolve for that too.
+    #[test]
+    fn a_spacing_change_counts_as_a_layout_change_for_the_page_in_hand() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        state.selection = 3;
+        state.view = AppView::Settings;
+        let changed = apply_setting(state);
+        assert_ne!(changed.line_spacing, state.line_spacing);
+        assert!(resolves_place(&open_book_command(
+            &changed, 0, 1, None, None
+        )));
+    }
+
+    /// Cycling a setting back to where it started leaves the page valid, so
+    /// the open keeps it. The stamp compares layouts, not edits.
+    #[test]
+    fn a_settings_round_trip_keeps_the_page_it_started_with() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        state.selection = 2;
+        state.view = AppView::Settings;
+        let there = apply_setting(state);
+        assert!(resolves_place(&open_book_command(&there, 0, 1, None, None)));
+        let back = apply_setting(there);
+        assert_eq!(back.font_weight, state.font_weight, "back where it started");
+        assert!(
+            !resolves_place(&open_book_command(&back, 0, 1, None, None)),
+            "so the page counted under that layout is good again"
+        );
+    }
+
     /// over a row number a rebuilt catalog had given to another book, and
     /// the next page turn extends by index without a fence, off a RAM window
     /// that checks the index and not which book the text came from.
@@ -6865,6 +6977,7 @@ mod tests {
                 type_settings: TypeSettings::DEFAULT,
                 portrait: false,
                 previous: None,
+                resolve_place: false,
             },
             StorageCommand::ExtendSection {
                 request_id: 1,

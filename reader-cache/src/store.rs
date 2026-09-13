@@ -1451,6 +1451,14 @@ impl ReaderStore {
             .unwrap_or(FontStyle::Regular)
     }
 
+    /// Whether the index describes only as much of the book as a build has
+    /// reached so far. A page total taken while this holds is a floor, not a
+    /// length, so nothing may divide by it and call the answer a fraction of
+    /// the book.
+    pub fn book_index_is_partial(&self) -> bool {
+        self.book_cache_partial
+    }
+
     pub fn advertised_page_count(&self) -> u32 {
         self.book_total_pages.max(self.page_count.max(1) as u32)
     }

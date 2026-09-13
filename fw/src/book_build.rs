@@ -960,46 +960,81 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
 /// identity, in which case no keyed cache access can prove ownership.
 /// Store where the reader is, under the copy's id.
 ///
-/// Best effort beside the position write: a copy with no id, a page outside
-/// the resident window, or a directory another id holds leaves the place
-/// unstored, and the position file still carries the page.
+/// `Ok(())` also covers the cases with nothing to store: a copy with no id
+/// yet, or a page outside the resident window. `Err` is the card refusing,
+/// which the caller owes a retry, because this is the position that survives
+/// a layout change and a move and the page-keyed file beside it is not.
 fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     library: &ReaderStore,
     index: usize,
     screen: u32,
-) where
+) -> Result<(), ()>
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let Some(id) = record_copy_id(root, library, index) else {
-        return;
+        return Ok(());
     };
     let Some(anchor) = library.anchor_for_global_page(screen) else {
-        return;
+        return Ok(());
     };
     let Some(entry) = library.catalog_entry(index) else {
-        return;
+        return Ok(());
     };
-    let total = library.advertised_page_count().max(1);
-    // Where the reader is through the book, for the one case the anchor
-    // cannot answer: the bytes changed under the copy.
-    let progression = ((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)) as u16;
-    match files::write_place(
-        root,
-        id,
-        anchor,
-        (entry.source_hash, entry.byte_size),
-        progression,
-    ) {
-        Ok(()) => {}
+    let source = (entry.source_hash, entry.byte_size);
+    let progression = match place_progression(root, library, id, screen) {
+        Some(progression) => progression,
+        // A page total from a half-built index is a floor, not a length, and
+        // dividing by it would call page 10 of an eventual 200 the halfway
+        // mark. The place keeps whatever fraction it already had, which was
+        // measured against a whole book.
+        None => return Ok(()),
+    };
+    match files::write_place(root, id, anchor, source, progression) {
+        Ok(()) => Ok(()),
+        // The explicitly chosen collision behavior: another copy's id holds
+        // the directory this one hashes to, and no retry changes that.
         Err(files::PlaceDenied::Taken) => {
             esp_println::println!("storage: another copy holds this place directory");
+            Ok(())
         }
         Err(files::PlaceDenied::Fault) => {
             esp_println::println!("storage: the place write failed");
+            Err(())
         }
     }
+}
+
+/// How far through the book the reader is, or `None` while the book's length
+/// is still being discovered.
+///
+/// `None` leaves the stored progression alone rather than replacing it with a
+/// worse one. It is read only when the source changes under the copy, so a
+/// stale fraction measured against the whole book beats a fresh one measured
+/// against the part of it that happens to be indexed.
+fn place_progression<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    id: proto::identity::BookId,
+    screen: u32,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.book_index_is_partial() {
+        return files::read_place(root, id).map(|place| place.progression);
+    }
+    let total = library.advertised_page_count().max(1);
+    Some(((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)) as u16)
 }
 
 /// The id of the copy at a catalog row, read from the row itself.
@@ -1079,8 +1114,18 @@ pub(crate) fn store_app_state(
                         root: at,
                         locator: path.as_str(),
                     };
-                    store_place(root, library, index, record.screen);
-                    match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    // The layout-independent place first, and its fault is
+                    // the save's fault: the page file beside it cannot carry
+                    // a place across a settings change or a move, so treating
+                    // a refused place as success would retire a retry the
+                    // reader needs.
+                    let place = store_place(root, library, index, record.screen);
+                    let position = match files::write_position_file(
+                        root,
+                        &owner,
+                        record.chapter,
+                        record.screen,
+                    ) {
                         Ok(()) => Ok(()),
                         // A full-hash twin's active claim holds the key.
                         // Deliberate and durable, not a card fault: this
@@ -1096,7 +1141,8 @@ pub(crate) fn store_app_state(
                             Ok(())
                         }
                         Err(files::ClaimDenied::Fault) => Err(()),
-                    }
+                    };
+                    place.and(position)
                 }
                 // No provable location means no directory this write can
                 // claim; the global record above still carries the place.
@@ -1151,8 +1197,9 @@ pub(crate) fn store_book_position(
             root: at,
             locator: path.as_str(),
         };
-        store_place(root, library, index as usize, record.screen);
-        match files::write_position_file(root, &owner, record.chapter, record.screen) {
+        let place = store_place(root, library, index as usize, record.screen);
+        let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
+        {
             Ok(()) => Ok(()),
             // A twin's active claim holds the key: the departing book's
             // place cannot be stored while it does, and refusing the whole
@@ -1164,7 +1211,11 @@ pub(crate) fn store_book_position(
                 Ok(())
             }
             Err(files::ClaimDenied::Fault) => Err(()),
-        }
+        };
+        // The departing book's place carries the same weight as its page, and
+        // for the same reason: nothing else records where it was in a form
+        // that survives a layout change.
+        place.and(position)
     })
     .ok()
     .is_some_and(|result| result.is_ok())
@@ -1187,21 +1238,57 @@ pub(crate) fn store_global_state(
         .is_some_and(|result| result.is_ok())
 }
 
-/// Where the reader left off in a catalog entry's copy, as a chapter and a
-/// global page.
+/// What a copy's stored place says, before any pagination exists to resolve
+/// it against.
 ///
-/// Two lookups, because the place is stored as content: the book index names
-/// the section, that section's page anchors name the page, and neither
-/// depends on the layout the place was written under. A copy with no stored
-/// place falls back to the old page-keyed position, and the next save
+/// Two shapes because two things can be stored. A place names content and has
+/// to be resolved once the book is paginated for this layout, which is the
+/// point of it: the page it lands on depends on the layout, and the layout is
+/// adopted by the open that reads this. A legacy position names a page under
+/// whatever layout wrote it, which is all an older card holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SavedPlace {
+    Place {
+        anchor: proto::anchor::ContentAnchor,
+        /// Whether the bytes the anchor was resolved against are still the
+        /// bytes at this locator. False demotes the anchor to a guess and
+        /// leaves the progression, per the reading-position PRD's R13.
+        exact: bool,
+        progression: u16,
+    },
+    Page {
+        chapter: u16,
+        page: u32,
+    },
+}
+
+impl SavedPlace {
+    /// Where to open while the place is still unresolved.
+    ///
+    /// For a place that is the spine item's first page: the item is known
+    /// from the anchor, and which page inside it needs a pagination that this
+    /// open has yet to build. [`resolve_place`] refines it once there is one.
+    pub(crate) fn provisional(self) -> (u16, u32) {
+        match self {
+            Self::Place { anchor, .. } => (anchor.spine, 0),
+            Self::Page { chapter, page } => (chapter, page),
+        }
+    }
+}
+
+/// The stored place for a catalog entry's copy, or the page an older card
+/// holds for it.
+///
+/// Reads the place first and falls back to the page-keyed position, so a card
+/// written by earlier firmware resumes where it left off. The next save
 /// publishes a place.
 #[inline(never)]
-pub(crate) fn load_position(
+pub(crate) fn load_place(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     index: usize,
-) -> Option<(u16, u32)> {
+) -> Option<SavedPlace> {
     let entry = library.catalog_entry(index)?;
     let identity = (entry.source_hash, entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
@@ -1214,48 +1301,83 @@ pub(crate) fn load_position(
         };
         if let Some(id) = record_copy_id(root, library, index) {
             if let Some(place) = files::read_place(root, id) {
-                let anchor = place.anchor;
-                // A place written against other bytes is a guess. The copy
-                // kept its id across the replacement, and the reader's place
-                // in the book it used to hold does not survive the edit that
-                // moved the text: an offset that still resolves says nothing
-                // about what sits there now. So the spine leads and the
-                // progression places the reader inside it, per R13.
-                if !place.describes(identity) {
-                    let total = library.advertised_page_count();
-                    let page = ((u64::from(place.progression) * u64::from(total))
-                        / u64::from(u16::MAX)) as u32;
-                    esp_println::println!(
-                        "restore: the source changed; resuming near {}/{}",
-                        page,
-                        total
-                    );
-                    return Some((anchor.spine, page));
-                }
-                let section = library
-                    .section_for_anchor(anchor)
-                    .and_then(|section| library.book_section(section));
-                let page = match section {
-                    Some(record) => {
-                        let within = files::page_of_anchor_in_section(
-                            root,
-                            &owner,
-                            library.layout_key(),
-                            record.spine,
-                            anchor,
-                        )
-                        .unwrap_or(0);
-                        record.start_page.saturating_add(u32::from(within))
-                    }
-                    // No book index yet, so the section that holds the place
-                    // is unknown. The chapter still is, and opening it at its
-                    // first page beats opening the book at its first.
-                    None => 0,
-                };
-                return Some((anchor.spine, page));
+                return Some(SavedPlace::Place {
+                    anchor: place.anchor,
+                    exact: place.describes(identity),
+                    progression: place.progression,
+                });
             }
         }
         files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
+            .map(|(chapter, page)| SavedPlace::Page { chapter, page })
+    })
+    .ok()
+    .flatten()
+}
+
+/// The page a stored place opens at, once the book is paginated for the
+/// layout this open adopted.
+///
+/// Has to run after the index is resident and cannot run before: the index
+/// that names sections and their start pages is the one thing that says where
+/// an anchor falls, and it belongs to a layout. Resolving against the index
+/// that happened to be in RAM would answer with another book's geometry, or
+/// with this book's under the settings the reader just left.
+///
+/// `None` for a place that needs no refining, or one this book cannot place.
+#[inline(never)]
+pub(crate) fn resolve_place(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+    place: SavedPlace,
+) -> Option<u32> {
+    let SavedPlace::Place {
+        anchor,
+        exact,
+        progression,
+    } = place
+    else {
+        return None;
+    };
+    let total = library.advertised_page_count();
+    if !exact {
+        // The bytes changed under the copy, so the anchor is a guess and the
+        // progression carries what an edit leaves: the reader lands nearby
+        // rather than at page one.
+        let page = ((u64::from(progression) * u64::from(total)) / u64::from(u16::MAX)) as u32;
+        esp_println::println!(
+            "restore: the source changed; resuming near {}/{}",
+            page,
+            total
+        );
+        return Some(page.min(total.saturating_sub(1)));
+    }
+    let entry = library.catalog_entry(index)?;
+    let identity = (entry.source_hash, entry.byte_size);
+    let record = library
+        .section_for_anchor(anchor)
+        .and_then(|section| library.book_section(section))?;
+    sd_session::with_root(epd, sd_cs, |root| {
+        let (at, path, _) = record_location(root, index, identity)?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        // By section, not by spine. One spine item can hold several sections,
+        // and the file is named for the section; the header's spine check
+        // then confirms the file is the item the anchor names.
+        let within = files::page_of_anchor_in_section(
+            root,
+            &owner,
+            library.layout_key(),
+            record.section,
+            anchor,
+        )?;
+        Some(record.start_page.saturating_add(u32::from(within)))
     })
     .ok()
     .flatten()

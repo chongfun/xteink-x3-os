@@ -953,6 +953,7 @@ fn dispatch_transition_storage(
             portrait,
             previous,
             catalog_epoch,
+            resolve_place,
         }) => Some(StorageCommand::OpenBook {
             request_id,
             book_id,
@@ -967,6 +968,7 @@ fn dispatch_transition_storage(
             // being read, which the state diff cannot tell from staying put.
             // The reducer's own reading stands only where no event answered.
             catalog_epoch: catalog_fence.or(catalog_epoch),
+            resolve_place,
         }),
         other => other,
     };

@@ -3803,6 +3803,11 @@ where
 
 /// Which page of one section holds `anchor`, as an index within that section.
 ///
+/// `section` is the section ordinal, which names the file. One spine item can
+/// hold several sections, so the spine is not that name, and the header's own
+/// spine is checked against the anchor to confirm the file holds the item the
+/// anchor names.
+///
 /// Reads the section's page anchors and nothing else. The open that follows
 /// reads the whole section, so this overlaps by a few hundred bytes once per
 /// resume. `None` leaves the caller on the section's first page.
@@ -3816,14 +3821,14 @@ pub fn page_of_anchor_in_section<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
     layout_key: u8,
-    spine: u16,
+    section: u16,
     anchor: proto::anchor::ContentAnchor,
 ) -> Option<u16>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, owner, layout_key, spine, Mode::ReadOnly, |file| {
+    with_v2_section_file(root, owner, layout_key, section, Mode::ReadOnly, |file| {
         let mut header = [0u8; SECTION_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header).is_err() {
             return None;
