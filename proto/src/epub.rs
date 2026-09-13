@@ -1431,6 +1431,13 @@ pub enum TocError {
 }
 
 pub trait XhtmlBlockSink {
+    /// Take one block of a spine item's content.
+    ///
+    /// `logical_offset` is where this block starts in that item's logical
+    /// content stream, the coordinate space `proto::anchor` defines. It is
+    /// assigned here because this is the only place that sees blocks before
+    /// anything wraps them: a sink that lays text out into lines cannot
+    /// recover it afterwards, since its own offsets move with the font.
     fn push_block(
         &mut self,
         text: &str,
@@ -1438,6 +1445,7 @@ pub trait XhtmlBlockSink {
         style: FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) -> Result<(), XhtmlError>;
 }
 
@@ -1915,6 +1923,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             style: FontStyle,
             align: TextAlign,
             paragraph_end: bool,
+            _logical_offset: u32,
         ) -> Result<(), XhtmlError> {
             if self.continuation_open {
                 if let Some(last) = self.output.last_mut() {
@@ -1997,6 +2006,10 @@ pub struct XhtmlBlockStreamParser {
     list_depth: usize,
     table_align_stack: [TextAlign; 4],
     table_depth: usize,
+    /// Bytes of this spine item's logical content stream already emitted.
+    /// Reset by construction, and a parser is built per spine item, so an
+    /// offset is always relative to the item a stored anchor names.
+    stream_offset: u32,
 }
 
 impl XhtmlBlockStreamParser {
@@ -2018,7 +2031,15 @@ impl XhtmlBlockStreamParser {
             list_depth: 0,
             table_align_stack: [TextAlign::Justify; 4],
             table_depth: 0,
+            stream_offset: 0,
         }
+    }
+
+    /// Bytes of the logical content stream emitted so far, which is where the
+    /// next block will start. Exposed for tests that check the coordinate
+    /// space directly rather than through a sink.
+    pub fn stream_offset(&self) -> u32 {
+        self.stream_offset
     }
 
     pub fn handle_start(
@@ -2063,7 +2084,9 @@ impl XhtmlBlockStreamParser {
         } else if tag_name_is(tag, "img") {
             self.flush(sink)?;
             let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
-            sink.push_block(
+            push_block_at(
+                sink,
+                &mut self.stream_offset,
                 placeholder,
                 TextRole::Body,
                 FontStyle::Italic,
@@ -2198,6 +2221,7 @@ impl XhtmlBlockStreamParser {
             style_for(self.bold_depth, self.italic_depth),
             self.align,
             sink,
+            &mut self.stream_offset,
         )
     }
 
@@ -2212,6 +2236,7 @@ impl XhtmlBlockStreamParser {
             style_for(self.bold_depth, self.italic_depth),
             self.align,
             sink,
+            &mut self.stream_offset,
         )
     }
 
@@ -2222,6 +2247,7 @@ impl XhtmlBlockStreamParser {
             style_for(self.bold_depth, self.italic_depth),
             self.align,
             sink,
+            &mut self.stream_offset,
         )
     }
 
@@ -3309,6 +3335,7 @@ fn append_text_to_sink_block<const N: usize>(
     style: FontStyle,
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
+    offset: &mut u32,
 ) -> Result<(), XhtmlError> {
     let mut previous_space = out
         .as_str()
@@ -3331,7 +3358,7 @@ fn append_text_to_sink_block<const N: usize>(
         let should_push_char = !ch.is_whitespace();
         if should_push_space {
             if out.push(' ').is_err() {
-                flush_sink_block_at_word_boundary(out, role, style, align, sink)?;
+                flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
                 let _ = out.push(' ');
                 previous_space = true;
             } else {
@@ -3339,7 +3366,7 @@ fn append_text_to_sink_block<const N: usize>(
             }
         } else if should_push_char {
             if out.push(ch).is_err() {
-                flush_sink_block_at_word_boundary(out, role, style, align, sink)?;
+                flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
                 if out.push(ch).is_err() {
                     break;
                 }
@@ -3351,15 +3378,34 @@ fn append_text_to_sink_block<const N: usize>(
     Ok(())
 }
 
+/// Push one block and advance the spine item's stream cursor past it.
+///
+/// The cursor advances only on a push that succeeded, so a refused block
+/// leaves no gap in the coordinate space.
+fn push_block_at(
+    sink: &mut impl XhtmlBlockSink,
+    offset: &mut u32,
+    text: &str,
+    role: TextRole,
+    style: FontStyle,
+    align: TextAlign,
+    paragraph_end: bool,
+) -> Result<(), XhtmlError> {
+    sink.push_block(text, role, style, align, paragraph_end, *offset)?;
+    *offset = offset.saturating_add(crate::anchor::block_stream_len(text.len()));
+    Ok(())
+}
+
 fn flush_sink_block_at_word_boundary<const N: usize>(
     block: &mut heapless::String<N>,
     role: TextRole,
     style: FontStyle,
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
+    offset: &mut u32,
 ) -> Result<(), XhtmlError> {
     let Some(split) = block.as_str().trim_end().rfind(char::is_whitespace) else {
-        return flush_sink_block(block, role, style, align, sink);
+        return flush_sink_block(block, role, style, align, sink, offset);
     };
     let carry_start = block.as_str()[split..]
         .char_indices()
@@ -3372,7 +3418,7 @@ fn flush_sink_block_at_word_boundary<const N: usize>(
     let _ = emit.push_str(block.as_str()[..split].trim_end());
     let _ = emit.push(' ');
     if !emit.is_empty() {
-        sink.push_block(emit.as_str(), role, style, align, false)?;
+        push_block_at(sink, offset, emit.as_str(), role, style, align, false)?;
     }
     *block = carry;
     Ok(())
@@ -3384,12 +3430,13 @@ fn flush_sink_block_continue<const N: usize>(
     style: FontStyle,
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
+    offset: &mut u32,
 ) -> Result<(), XhtmlError> {
     if block.as_str().trim().is_empty() {
         block.clear();
         return Ok(());
     }
-    let result = sink.push_block(block.as_str(), role, style, align, false);
+    let result = push_block_at(sink, offset, block.as_str(), role, style, align, false);
     block.clear();
     result
 }
@@ -3458,12 +3505,13 @@ fn flush_sink_block<const N: usize>(
     style: FontStyle,
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
+    offset: &mut u32,
 ) -> Result<(), XhtmlError> {
     if block.as_str().trim().is_empty() {
         block.clear();
-        return sink.push_block("", role, style, align, true);
+        return push_block_at(sink, offset, "", role, style, align, true);
     }
-    let result = sink.push_block(block.as_str(), role, style, align, true);
+    let result = push_block_at(sink, offset, block.as_str(), role, style, align, true);
     block.clear();
     result
 }
@@ -3914,6 +3962,7 @@ mod tests {
             style: FontStyle,
             align: TextAlign,
             paragraph_end: bool,
+            _logical_offset: u32,
         ) -> Result<(), XhtmlError> {
             if !text.is_empty() {
                 self.fragments
@@ -3997,6 +4046,7 @@ mod tests {
                 _style: FontStyle,
                 _align: TextAlign,
                 paragraph_end: bool,
+                _logical_offset: u32,
             ) -> Result<(), XhtmlError> {
                 self.0.push((text.into(), paragraph_end));
                 Ok(())
@@ -4629,6 +4679,7 @@ mod tests {
                 _style: FontStyle,
                 _align: TextAlign,
                 paragraph_end: bool,
+                _logical_offset: u32,
             ) -> Result<(), XhtmlError> {
                 if text.is_empty() {
                     return Ok(());
@@ -4669,6 +4720,7 @@ mod tests {
                 _style: FontStyle,
                 _align: TextAlign,
                 _paragraph_end: bool,
+                _logical_offset: u32,
             ) -> Result<(), XhtmlError> {
                 self.text.push_str(text);
                 Ok(())
@@ -4703,6 +4755,7 @@ mod tests {
                 _style: FontStyle,
                 _align: TextAlign,
                 _paragraph_end: bool,
+                _logical_offset: u32,
             ) -> Result<(), XhtmlError> {
                 self.text.push_str(text);
                 Ok(())
@@ -5367,6 +5420,7 @@ mod tests {
                 style: FontStyle,
                 align: TextAlign,
                 paragraph_end: bool,
+                _logical_offset: u32,
             ) -> Result<(), XhtmlError> {
                 self.fragments
                     .push((text.into(), role, style, align, paragraph_end));
@@ -5616,5 +5670,113 @@ mod tests {
         );
         assert!(res_full.is_ok());
         assert_eq!(opf_path_buf.as_str(), "OEBPS/content.opf");
+    }
+
+    /// A sink that records what the coordinate space looked like: every
+    /// block's offset and the text that claimed it.
+    #[derive(Default)]
+    struct OffsetSink {
+        blocks: std::vec::Vec<(u32, std::string::String)>,
+    }
+
+    impl XhtmlBlockSink for OffsetSink {
+        fn push_block(
+            &mut self,
+            text: &str,
+            _role: TextRole,
+            _style: FontStyle,
+            _align: TextAlign,
+            _paragraph_end: bool,
+            logical_offset: u32,
+        ) -> Result<(), XhtmlError> {
+            self.blocks.push((logical_offset, text.into()));
+            Ok(())
+        }
+    }
+
+    const ANCHOR_DOC: &str = concat!(
+        "<html><body><p>The first paragraph, which runs on for a while so ",
+        "that the wrap point matters.</p><p>Second.</p>",
+        "<img src=\"plate.png\" alt=\"A plate\"/><p>Third and last.</p></body></html>"
+    );
+
+    #[test]
+    fn every_block_starts_where_the_one_before_it_ended() {
+        let mut sink = OffsetSink::default();
+        xhtml_blocks_to_sink(ANCHOR_DOC, None, &mut sink).expect("parses");
+        assert!(sink.blocks.len() >= 4, "{:?}", sink.blocks);
+        assert_eq!(sink.blocks[0].0, 0, "the first block opens the stream");
+        for pair in sink.blocks.windows(2) {
+            let (offset, text) = &pair[0];
+            let (next_offset, _) = &pair[1];
+            assert_eq!(
+                *next_offset,
+                offset + crate::anchor::block_stream_len(text.len()),
+                "offsets run contiguously: {:?}",
+                sink.blocks
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_holds_a_place_of_its_own() {
+        let mut sink = OffsetSink::default();
+        xhtml_blocks_to_sink(ANCHOR_DOC, None, &mut sink).expect("parses");
+        let plate = sink
+            .blocks
+            .iter()
+            .position(|(_, text)| text.contains("A plate"))
+            .expect("the image emits a block");
+        assert!(plate > 0, "with a paragraph before it");
+        let before = sink.blocks[plate - 1].0;
+        let at = sink.blocks[plate].0;
+        let after = sink.blocks[plate + 1].0;
+        assert!(before < at && at < after, "and a place between them");
+    }
+
+    #[test]
+    fn a_streamed_parse_lands_on_the_same_offsets() {
+        // The one way this coordinate space could drift without anyone
+        // noticing: firmware feeds the parser in bounded windows, and a
+        // window boundary must not move a block's place in the stream.
+        let mut whole = OffsetSink::default();
+        xhtml_blocks_to_sink(ANCHOR_DOC, None, &mut whole).expect("parses");
+
+        for window in [1usize, 3, 7, 64, 4096] {
+            let mut streamed = OffsetSink::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            let bytes = ANCHOR_DOC.as_bytes();
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let end = (at + window).min(bytes.len());
+                tokenizer
+                    .feed_xhtml_blocks(&bytes[at..end], &mut parser, None, &mut streamed)
+                    .expect("feeds");
+                at = end;
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finishes");
+            assert_eq!(
+                streamed.blocks, whole.blocks,
+                "a {window}-byte window changed the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_reports_where_the_next_block_goes() {
+        let mut sink = OffsetSink::default();
+        let mut parser = XhtmlBlockStreamParser::new(true);
+        assert_eq!(parser.stream_offset(), 0, "a fresh spine item starts at 0");
+        parser.handle_text("Some words.", &mut sink).expect("text");
+        parser.finish(&mut sink).expect("finish");
+        let (offset, text) = sink.blocks.last().expect("a block").clone();
+        assert_eq!(
+            parser.stream_offset(),
+            offset + crate::anchor::block_stream_len(text.len()),
+            "and ends past the block it emitted"
+        );
     }
 }

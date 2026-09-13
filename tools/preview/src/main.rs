@@ -434,6 +434,7 @@ impl XhtmlBlockSink for PreviewSink<'_> {
         style: proto::text::FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        _logical_offset: u32,
     ) -> Result<(), XhtmlError> {
         push_styled_fragment(
             self,

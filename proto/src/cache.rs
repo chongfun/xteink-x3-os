@@ -2,7 +2,7 @@ use crate::text::{FontStyle, TextAlign, TextRole};
 use heapless::String;
 
 pub const CACHE_MAGIC: u32 = 0x5834_5244; // X4RD
-pub const CACHE_VERSION: u16 = 1;
+pub const CACHE_VERSION: u16 = 2;
 // Bumped 21 -> 23 with the spine-cap fix. A long book cached under the old
 // 96-item spine cap was written with partial=false (truncation never tripped
 // book_partial), so it would load as a clean hit and keep stranding the tail
@@ -59,6 +59,11 @@ pub const BOOK_V2_HEADER_BYTES: usize = 56;
 pub const BOOK_V2_SECTION_RECORD_BYTES: usize = 16;
 pub const PAGE_HEADER_BYTES: usize = 28;
 pub const PAGE_RECORD_BYTES: usize = 4;
+/// One page's anchor offset, stored beside the page records rather than in
+/// them. A `PageRecord` says which blocks a page holds, which a reader can
+/// re-derive by walking; where the page sits in the book's content cannot be
+/// re-derived from anything the layout keeps, so it is written down.
+pub const PAGE_ANCHOR_BYTES: usize = 4;
 pub const LINE_RECORD_BYTES: usize = 12;
 pub const WORD_RECORD_BYTES: usize = 12;
 pub const BLOCK_RECORD_BYTES: usize = 12;
@@ -99,9 +104,9 @@ pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 /// replay a stream captured under older parse semantics.
 pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
-pub const CONTENT_VERSION: u16 = 3;
+pub const CONTENT_VERSION: u16 = 4;
 pub const CONTENT_HEADER_BYTES: usize = 24;
-pub const CONTENT_RECORD_HEADER_BYTES: usize = 8;
+pub const CONTENT_RECORD_HEADER_BYTES: usize = 12;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
 const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
 const CONTENT_RECORD_FLAG_SPINE_END: u8 = 1 << 1;
@@ -129,6 +134,10 @@ pub struct ContentRecordHeader {
     pub align: TextAlign,
     pub paragraph_end: bool,
     pub spine_end: bool,
+    /// Where this block starts in its spine item's logical content stream.
+    /// A replay rebuilds from these blocks alone and the parser does not run
+    /// again, so an invented offset would move every anchor it rebuilds.
+    pub logical_offset: u32,
 }
 
 pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -187,6 +196,7 @@ pub fn encode_content_record_header(
     out[6] = align_byte(record.align);
     out[7] = (u8::from(record.paragraph_end) * CONTENT_RECORD_FLAG_PARAGRAPH_END)
         | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END);
+    write_u32(out, 8, record.logical_offset);
     Ok(CONTENT_RECORD_HEADER_BYTES)
 }
 
@@ -200,6 +210,7 @@ pub fn decode_content_record_header(input: &[u8]) -> Result<ContentRecordHeader,
         align: align_from_byte(input[6])?,
         paragraph_end: input[7] & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
         spine_end: input[7] & CONTENT_RECORD_FLAG_SPINE_END != 0,
+        logical_offset: read_u32(input, 8)?,
     };
     if record.spine_end && record.text_len != 0 {
         return Err(CacheError::BadLength);
@@ -600,6 +611,7 @@ pub fn section_cache_size(header: SectionHeader) -> usize {
 pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
     SECTION_V2_HEADER_BYTES
         + header.page_count as usize * PAGE_RECORD_BYTES
+        + header.page_count as usize * PAGE_ANCHOR_BYTES
         + header.block_count as usize * BLOCK_RECORD_BYTES
         + header.block_count as usize
         + header.text_bytes as usize
@@ -1756,6 +1768,7 @@ mod tests {
             align: TextAlign::Center,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         let marker = ContentRecordHeader {
             spine_index: 12,
@@ -1765,6 +1778,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         for record in [block, marker] {
             let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
@@ -1785,6 +1799,7 @@ mod tests {
                 align: TextAlign::Justify,
                 paragraph_end: false,
                 spine_end: false,
+                logical_offset: 0,
             },
             &mut bytes,
         )
@@ -1806,6 +1821,7 @@ mod tests {
                 align: TextAlign::Left,
                 paragraph_end: false,
                 spine_end: true,
+                logical_offset: 0,
             },
             &mut bytes,
         )
@@ -2023,7 +2039,12 @@ mod tests {
         assert_eq!(decode_section_v2_header(&bytes).unwrap(), header);
         assert_eq!(
             section_v2_cache_size(header),
-            SECTION_V2_HEADER_BYTES + PAGE_RECORD_BYTES * 2 + BLOCK_RECORD_BYTES * 3 + 3 + 19
+            SECTION_V2_HEADER_BYTES
+                + PAGE_RECORD_BYTES * 2
+                + PAGE_ANCHOR_BYTES * 2
+                + BLOCK_RECORD_BYTES * 3
+                + 3
+                + 19
         );
 
         bytes[4] = CACHE_VERSION as u8;
@@ -2564,6 +2585,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec1, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"abcd");
@@ -2578,6 +2600,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec2, &mut buffer[offset..]).unwrap();
         let spine_0_end_offset = offset;
@@ -2592,6 +2615,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec3, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"efgh");
@@ -2606,6 +2630,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec4, &mut buffer[offset..]).unwrap();
         let full_len = offset;
@@ -2691,6 +2716,7 @@ mod tests {
                 align: TextAlign::Left,
                 paragraph_end: false,
                 spine_end: true,
+                logical_offset: 0,
             },
             &mut flipped[rec4_offset..rec4_offset + CONTENT_RECORD_HEADER_BYTES],
         )

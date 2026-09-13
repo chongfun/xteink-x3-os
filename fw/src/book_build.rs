@@ -2376,11 +2376,19 @@ where
         style: proto::text::FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) -> Result<(), XhtmlError> {
-        self.capture
-            .push_block_record(self.spine_index, text, role, style, align, paragraph_end);
+        self.capture.push_block_record(
+            self.spine_index,
+            text,
+            role,
+            style,
+            align,
+            paragraph_end,
+            logical_offset,
+        );
         self.inner
-            .push_block(text, role, style, align, paragraph_end)
+            .push_block(text, role, style, align, paragraph_end, logical_offset)
     }
 }
 
@@ -2609,6 +2617,7 @@ where
                         record.style,
                         record.align,
                         record.paragraph_end,
+                        record.logical_offset,
                     )
                     .is_err()
                 {
@@ -2933,6 +2942,18 @@ struct LibraryBlockSink<
     /// Latched when a page record was dropped past the `pages` capacity,
     /// mirroring the full rebuild's silent drop.
     page_overflowed: bool,
+    /// Where the parser block being consumed starts in the spine item's
+    /// logical content stream, and how long it is.
+    block_offset: u32,
+    block_len: u32,
+    /// How much of that block the lines have taken, counted as the words go
+    /// by: the text reaching this sink is decoded and normalized, so it no
+    /// longer indexes the parser's bytes. Clamped to the block, which keeps
+    /// every anchor inside the block it came from and in order.
+    block_consumed: u32,
+    /// Where the line being accumulated began. Becomes the anchor of a page
+    /// when this line is the one that opens it.
+    line_offset: u32,
 }
 
 impl<'a, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -2987,6 +3008,10 @@ where
             target_pages,
             generate_toc_from_headings,
             generated_toc_for_spine: false,
+            block_offset: 0,
+            block_len: 0,
+            block_consumed: 0,
+            line_offset: 0,
             page_cursor: ui::reading::PageIndexCursor::start(page_box),
             page_overflowed: false,
         }
@@ -3099,8 +3124,26 @@ where
     /// index through the shared incremental cursor — O(1) per line.
     fn note_block_appended(&mut self) {
         let index = self.library.block_count() - 1;
+        let pages_before = self.library.page_count();
         self.page_overflowed |=
             layout::place_appended_block(self.library, &mut self.page_cursor, index);
+        if self.library.page_count() > pages_before {
+            // This line opened the page, so where the line began is where the
+            // page begins.
+            self.library.set_last_page_offset(self.line_offset);
+        }
+    }
+
+    /// Take one word into the line in progress.
+    fn note_word_placed(&mut self, word_len: usize, line_was_empty: bool) {
+        if line_was_empty {
+            self.line_offset = self.block_offset.saturating_add(self.block_consumed);
+        }
+        let taken = (word_len as u32).saturating_add(1);
+        self.block_consumed = self
+            .block_consumed
+            .saturating_add(taken)
+            .min(self.block_len);
     }
 
     /// Bounded fix-up for `mark_last_block_paragraph_end`: the mark grows
@@ -3225,11 +3268,15 @@ where
         style: proto::text::FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) -> Result<(), XhtmlError> {
         if self.stopped {
             return Err(XhtmlError::TooManyRuns);
         }
         self.flush_if_full();
+        self.block_offset = logical_offset;
+        self.block_len = text.len() as u32;
+        self.block_consumed = 0;
         push_styled_preview_fragment(
             self,
             text,
@@ -3364,6 +3411,7 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
+            sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
@@ -3374,6 +3422,7 @@ fn push_styled_preview_fragment<
         let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
         let _ = measure.push_str(&sink.line[kept_len..]);
         sink.push_line_ink_str(measure.as_str());
+        sink.note_word_placed(word.len(), line_was_empty);
 
         // The line in progress opens a paragraph while no line of it has
         // flushed yet: the previous block still closes a paragraph. Once the
@@ -3395,6 +3444,7 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
+            sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;

@@ -17,8 +17,8 @@ use proto::cache::{
     BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE,
     CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
     CACHE_V2_DIR, CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES,
-    PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES,
-    TOC_RECORD_BYTES,
+    PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
+    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -3155,6 +3155,10 @@ where
 
     /// Record one `push_block` call. The text follows the fixed record
     /// header; see `proto::cache::ContentRecordHeader`.
+    // One captured block, written out field by field rather than as a
+    // record struct: the caller is the sink's own push_block, whose
+    // arguments these already are.
+    #[expect(clippy::too_many_arguments)]
     pub fn push_block_record(
         &mut self,
         spine_index: u16,
@@ -3163,6 +3167,7 @@ where
         style: proto::text::FontStyle,
         align: proto::text::TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) {
         if self.file.is_none() {
             return;
@@ -3185,6 +3190,7 @@ where
                 align,
                 paragraph_end,
                 spine_end: false,
+                logical_offset,
             },
             &mut header,
         )
@@ -3213,6 +3219,7 @@ where
                 role: proto::text::TextRole::Body,
                 style: proto::text::FontStyle::Regular,
                 align: proto::text::TextAlign::Left,
+                logical_offset: 0,
                 paragraph_end: false,
                 spine_end: true,
             },
@@ -3657,6 +3664,14 @@ where
     }) {
         return false;
     }
+    if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
+        library.set_cached_page_offset(
+            index,
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        )
+    }) {
+        return false;
+    }
     if !read_records_batched(file, BLOCK_RECORD_BYTES, block_count, |index, bytes| {
         let Ok(block) = decode_block(bytes) else {
             return false;
@@ -3752,6 +3767,12 @@ where
             || stage.push(&record[..PAGE_RECORD_BYTES]).is_err()
         {
             cache_log!("cache: write page record failed");
+            return false;
+        }
+    }
+    for offset in library.page_offset.iter().take(library.page_count) {
+        if stage.push(&offset.to_le_bytes()).is_err() {
+            cache_log!("cache: write page anchor failed");
             return false;
         }
     }

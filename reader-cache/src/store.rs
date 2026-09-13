@@ -2,6 +2,7 @@ use app_core::browse::Browse;
 use app_core::{ReaderSource, MAX_SD_CHAPTERS};
 use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
+use proto::anchor::ContentAnchor;
 use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
@@ -356,6 +357,10 @@ pub struct ReaderStore {
     pub(crate) block_count: usize,
     pub(crate) pages: [PageRecord; MAX_READER_PAGES],
     pub(crate) page_spine: [u16; MAX_READER_PAGES],
+    /// Where each page starts in its spine item's logical content stream.
+    /// Together with `page_spine` this is the page's `ContentAnchor`, kept
+    /// as two arrays because that is how the rest of the page state is kept.
+    pub(crate) page_offset: [u32; MAX_READER_PAGES],
     pub(crate) page_count: usize,
     type_settings: TypeSettings,
     /// Whether the current layout paginates into the portrait page box.
@@ -449,6 +454,7 @@ impl ReaderStore {
             block_count: 0,
             pages: [EMPTY_PAGE_RECORD; MAX_READER_PAGES],
             page_spine: [0; MAX_READER_PAGES],
+            page_offset: [0; MAX_READER_PAGES],
             page_count: 0,
             type_settings: ZERO_TYPE_SETTINGS,
             portrait: false,
@@ -912,6 +918,7 @@ impl ReaderStore {
         for (index, page) in self.pages.iter_mut().enumerate() {
             *page = EMPTY_PAGE_RECORD;
             self.page_spine[index] = 0;
+            self.page_offset[index] = 0;
         }
     }
 
@@ -954,6 +961,7 @@ impl ReaderStore {
         for (index, page) in self.pages.iter_mut().enumerate() {
             *page = EMPTY_PAGE_RECORD;
             self.page_spine[index] = 0;
+            self.page_offset[index] = 0;
         }
     }
 
@@ -1128,6 +1136,56 @@ impl ReaderStore {
         self.pages[index] = page;
         self.page_spine[index] = spine;
         true
+    }
+
+    /// Where a page read back from a section file starts in its item's
+    /// content. Separate from [`set_cached_page`](Self::set_cached_page)
+    /// because the two come off the card in separate passes.
+    pub(crate) fn set_cached_page_offset(&mut self, index: usize, offset: u32) -> bool {
+        if index >= self.page_offset.len() {
+            return false;
+        }
+        self.page_offset[index] = offset;
+        true
+    }
+
+    /// The anchor a page starts at. A reading position stores this when the
+    /// reader turns onto the page.
+    pub fn page_anchor(&self, index: usize) -> Option<ContentAnchor> {
+        if index >= self.page_count {
+            return None;
+        }
+        Some(ContentAnchor::at(
+            self.page_spine[index],
+            self.page_offset[index],
+        ))
+    }
+
+    /// The resident page holding `anchor`, by the rule the whole feature
+    /// keeps: the last page starting at or before it. `None` when no resident
+    /// page starts that early, which is a caller's cue to load the section
+    /// the anchor names rather than to move the reader.
+    pub fn resident_page_containing(&self, anchor: ContentAnchor) -> Option<usize> {
+        let mut found = None;
+        for index in 0..self.page_count {
+            let start = ContentAnchor::at(self.page_spine[index], self.page_offset[index]);
+            if start <= anchor {
+                found = Some(index);
+            } else {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Record where a page just opened by the build starts. The build appends
+    /// pages in order, so this always names the last one.
+    pub fn set_last_page_offset(&mut self, offset: u32) {
+        if let Some(last) = self.page_count.checked_sub(1) {
+            if last < self.page_offset.len() {
+                self.page_offset[last] = offset;
+            }
+        }
     }
 
     pub(crate) fn set_cached_block(
@@ -1971,5 +2029,107 @@ mod tests {
             (40, 5, 900),
             "all three counters describe one arena and must come back together"
         );
+    }
+
+    /// Lay a book out as pages, the way a build does: each entry is one
+    /// page's first line and where that line begins in the spine item's
+    /// content. Two layouts of one book differ only in where the breaks
+    /// fall, so these tests vary that and nothing else.
+    fn lay_out(store: &mut ReaderStore, spine: u16, starts: &[u32]) {
+        for (index, offset) in starts.iter().enumerate() {
+            assert!(store.set_cached_page(
+                index,
+                PageRecord {
+                    first_block: index as u16,
+                    block_count: 1,
+                },
+                spine,
+            ));
+            assert!(store.set_cached_page_offset(index, *offset));
+        }
+        store.page_count = starts.len();
+    }
+
+    #[test]
+    fn a_page_reports_the_anchor_it_starts_at() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 3, &[0, 512, 1_024]);
+        assert_eq!(store.page_anchor(0), Some(ContentAnchor::at(3, 0)));
+        assert_eq!(store.page_anchor(2), Some(ContentAnchor::at(3, 1_024)));
+        assert_eq!(store.page_anchor(3), None, "past the resident pages");
+    }
+
+    #[test]
+    fn a_place_resolves_to_the_page_that_holds_it() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 0, &[0, 512, 1_024]);
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 0)),
+            Some(0),
+            "a page owns its own start"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 511)),
+            Some(0),
+            "and everything up to the next start"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 512)),
+            Some(1),
+            "which the next page owns"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 9_999)),
+            Some(2),
+            "a place past the last break is on the last page"
+        );
+    }
+
+    #[test]
+    fn a_place_before_the_resident_window_asks_for_a_load() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 4, &[0, 512]);
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(2, 800)),
+            None,
+            "an earlier spine item is not in this window"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(9, 0)),
+            Some(1),
+            "a later one resolves to the last page, which is where reading \
+             continues while the next section loads"
+        );
+    }
+
+    /// The property the whole feature rests on: the reader's place is a
+    /// coordinate in the content, so re-laying the same book under different
+    /// typography moves the page breaks and not the place.
+    #[test]
+    fn the_same_place_survives_a_relayout() {
+        let place = ContentAnchor::at(1, 700);
+
+        // A larger font: fewer words per page, so breaks come often.
+        let mut large = Box::new(ReaderStore::new());
+        lay_out(&mut large, 1, &[0, 240, 480, 720, 960]);
+        let on_large = large
+            .resident_page_containing(place)
+            .expect("the place is on a page");
+
+        // A smaller font over the same content: the same text, broken later.
+        let mut small = Box::new(ReaderStore::new());
+        lay_out(&mut small, 1, &[0, 600, 1_200]);
+        let on_small = small
+            .resident_page_containing(place)
+            .expect("the place is on a page here too");
+
+        assert_ne!(on_large, on_small, "the page number is not the same");
+        for (store, page) in [(&large, on_large), (&small, on_small)] {
+            let start = store.page_anchor(page).expect("a start");
+            assert!(start <= place, "and each page begins at or before it");
+            if let Some(next) = store.page_anchor(page + 1) {
+                assert!(place < next, "and ends before the next one begins");
+            }
+        }
     }
 }
