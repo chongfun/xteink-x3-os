@@ -518,6 +518,11 @@ pub struct BookV2SectionRecord {
     pub start_page: u32,
     pub page_count: u16,
     pub partial: bool,
+    /// Where this section's first page starts in its spine item's logical
+    /// content stream, so a stored place is resolved from the book index and
+    /// one section file rather than from every section file of the item.
+    /// Written into four bytes the record already reserved.
+    pub logical_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1208,7 +1213,7 @@ pub fn encode_book_v2_section(
     write_u16(out, 8, record.page_count);
     out[10] = record.partial as u8;
     out[11] = 0;
-    write_u32(out, 12, 0);
+    write_u32(out, 12, record.logical_offset);
     Ok(BOOK_V2_SECTION_RECORD_BYTES)
 }
 
@@ -1220,6 +1225,7 @@ pub fn decode_book_v2_section(input: &[u8]) -> Result<BookV2SectionRecord, Cache
         start_page: read_u32(input, 4)?,
         page_count: read_u16(input, 8)?,
         partial: input[10] != 0,
+        logical_offset: read_u32(input, 12)?,
     })
 }
 
@@ -1703,6 +1709,7 @@ mod tests {
             start_page,
             page_count: 10,
             partial: false,
+            logical_offset: 0,
         }
     }
 
@@ -2080,6 +2087,7 @@ mod tests {
             start_page: 42,
             page_count: 12,
             partial: false,
+            logical_offset: 0,
         };
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         let mut section_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];

@@ -285,6 +285,7 @@ fn write_section(
         start_page,
         page_count,
         partial: false,
+        logical_offset: 0,
     }
 }
 
@@ -967,6 +968,85 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
 /// Position is the one non-rebuildable thing under a key, so the new lookup
 /// must recover it from the old directory; a mutation that drops the legacy
 /// layer resumes every such book at the beginning.
+fn book_id(seed: u8) -> proto::identity::BookId {
+    proto::identity::BookId::from_bytes([seed; 16]).expect("a non-zero id")
+}
+
+/// The whole point of the format: a place belongs to the copy, so it is
+/// legible after anything that used to lose it.
+#[test]
+fn a_place_belongs_to_the_copy_rather_than_to_a_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(7);
+    let anchor = proto::anchor::ContentAnchor::at(3, 4_096);
+
+    assert_eq!(files::read_place(&root, id), None, "nothing stored yet");
+    files::write_place(&root, id, anchor).expect("the place stores");
+    assert_eq!(files::read_place(&root, id), Some(anchor));
+
+    // Nothing about the book's file reached that write, so nothing about the
+    // file can invalidate it. A second copy of the same book keeps its own.
+    let twin = book_id(9);
+    assert_eq!(files::read_place(&root, twin), None, "a twin starts fresh");
+    let twin_anchor = proto::anchor::ContentAnchor::at(0, 12);
+    files::write_place(&root, twin, twin_anchor).expect("the twin stores its own");
+    assert_eq!(
+        files::read_place(&root, id),
+        Some(anchor),
+        "and not over this one"
+    );
+    assert_eq!(files::read_place(&root, twin), Some(twin_anchor));
+}
+
+#[test]
+fn a_place_is_rewritten_in_place_and_survives_the_write() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(4);
+    for page in 0..6u32 {
+        let anchor = proto::anchor::ContentAnchor::at(1, page * 700);
+        files::write_place(&root, id, anchor).expect("saves");
+        assert_eq!(
+            files::read_place(&root, id),
+            Some(anchor),
+            "each save reads back, so the two generations alternate cleanly"
+        );
+    }
+}
+
+/// A place written by a build whose content stream differs cannot be read as
+/// content, and opening at the start beats opening somewhere wrong.
+#[test]
+fn a_place_from_another_content_stream_is_not_believed() {
+    let mut bytes = proto::nvm::PlaceRecord {
+        id: book_id(2),
+        anchor: proto::anchor::ContentAnchor::at(5, 50),
+    }
+    .encode();
+    assert!(proto::nvm::PlaceRecord::decode(&bytes).is_some());
+    bytes[5] = bytes[5].wrapping_add(1);
+    assert_eq!(
+        proto::nvm::PlaceRecord::decode(&bytes),
+        None,
+        "a stream version this build does not index the same way"
+    );
+
+    let mut torn = proto::nvm::PlaceRecord {
+        id: book_id(2),
+        anchor: proto::anchor::ContentAnchor::at(5, 50),
+    }
+    .encode();
+    torn[12] ^= 0xFF;
+    assert_eq!(
+        proto::nvm::PlaceRecord::decode(&torn),
+        None,
+        "and a torn one fails its checksum"
+    );
+}
+
 #[test]
 fn a_position_saved_under_the_old_key_survives_the_re_key() {
     let disk = new_card();

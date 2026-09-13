@@ -236,6 +236,104 @@ fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
         .map(|record| (record.chapter, record.screen))
 }
 
+/// Where per-copy reading places live, beside the caches rather than inside
+/// one, because a place belongs to the copy and a cache belongs to a file.
+const PLACES_DIR: &str = "PLACES";
+/// The two generations one copy's place is written across, the same pair the
+/// per-book position files use, in a directory named from the copy's id.
+const PLACE_GENERATIONS: [&str; 2] = ["POSA.BIN", "POSB.BIN"];
+const PLACE_DURABLE_MAGIC: [u8; 4] = *b"X4PL";
+
+/// A copy's directory name: eight hex digits of a hash of its id, which is
+/// the whole 8.3 stem. The id is 32 hex digits and no FAT name holds it, so
+/// the record inside carries it in full and a reader checks it.
+fn place_dir_name(id: proto::identity::BookId) -> heapless::String<8> {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in id.to_bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let mut out = heapless::String::<8>::new();
+    for shift in (0..8).rev() {
+        let nibble = (hash >> (shift * 4)) & 0xF;
+        let _ = out.push(char::from_digit(nibble, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// Why a place could not be stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceDenied {
+    /// The card refused a read or a write.
+    Fault,
+    /// Another copy's id already holds this directory. Its place stays, and
+    /// this copy has nowhere durable to put one.
+    Taken,
+}
+
+/// Store where a reader left off in one copy.
+///
+/// The anchor is content, so this survives every layout change and every move
+/// of the file. What it does not survive is the copy being forgotten, which
+/// is the point: a place belongs to a `BookId`.
+pub fn write_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+    anchor: proto::anchor::ContentAnchor,
+) -> Result<(), PlaceDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|_| PlaceDenied::Fault)?;
+    let places = open_or_make_dir(&cache_root, PLACES_DIR).map_err(|_| PlaceDenied::Fault)?;
+    let name = place_dir_name(id);
+    let copy = open_or_make_dir(&places, name.as_str()).map_err(|_| PlaceDenied::Fault)?;
+    match read_place_in(&copy) {
+        Some(record) if record.id != id => return Err(PlaceDenied::Taken),
+        _ => {}
+    }
+    write_two_generation(
+        &copy,
+        PLACE_GENERATIONS,
+        PLACE_DURABLE_MAGIC,
+        &proto::nvm::PlaceRecord { id, anchor }.encode(),
+    )
+    .map_err(|_| PlaceDenied::Fault)
+}
+
+/// Where the reader left off in this copy, or `None` when nothing legible is
+/// stored for it. A directory holding another copy's id reads as `None` for
+/// the same reason it refuses a write.
+pub fn read_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+) -> Option<proto::anchor::ContentAnchor>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let places = cache_root.open_dir(PLACES_DIR).ok()?;
+    let copy = places.open_dir(place_dir_name(id).as_str()).ok()?;
+    let record = read_place_in(&copy)?;
+    (record.id == id).then_some(record.anchor)
+}
+
+fn read_place_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    copy: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<proto::nvm::PlaceRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut bytes = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
+    if !read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
+        return None;
+    }
+    proto::nvm::PlaceRecord::decode(&bytes)
+}
+
 /// Per-book reading position beside the book's cache records, so
 /// switching books does not abandon the previous one's place.
 ///
@@ -3360,6 +3458,60 @@ where
     section_file_name(spine, &mut name);
     let file = sections.open_file_in_dir(name.as_str(), mode).ok()?;
     Some(f(&file))
+}
+
+/// Which page of one section holds `anchor`, as an index within that section.
+///
+/// Reads the section's page anchors and nothing else. The open that follows
+/// reads the whole section, so this overlaps by a few hundred bytes once per
+/// resume. `None` leaves the caller on the section's first page.
+pub fn page_of_anchor_in_section<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    spine: u16,
+    anchor: proto::anchor::ContentAnchor,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_section_file(root, owner, spine, Mode::ReadOnly, |file| {
+        let mut header = [0u8; SECTION_V2_HEADER_BYTES];
+        if read_exact_file(file, &mut header).is_err() {
+            return None;
+        }
+        let header = decode_section_v2_header(&header).ok()?;
+        if header.spine != anchor.spine {
+            return None;
+        }
+        let page_count = header.page_count as usize;
+        if page_count == 0 {
+            return None;
+        }
+        let skip = (page_count * PAGE_RECORD_BYTES) as u32;
+        file.seek_from_current(skip as i32).ok()?;
+        let mut found = 0u16;
+        let mut bytes = [0u8; PAGE_ANCHOR_BYTES];
+        for index in 0..page_count {
+            if read_exact_file(file, &mut bytes).is_err() {
+                break;
+            }
+            let offset = u32::from_le_bytes(bytes);
+            if proto::anchor::ContentAnchor::at(header.spine, offset) <= anchor {
+                found = index as u16;
+            } else {
+                break;
+            }
+        }
+        Some(found)
+    })
+    .flatten()
 }
 
 fn with_v2_book_file<

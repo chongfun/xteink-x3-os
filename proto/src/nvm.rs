@@ -399,6 +399,73 @@ impl PositionRecord {
     }
 }
 
+/// A reader's place in one library copy, addressed by the copy rather than by
+/// where its file sits.
+///
+/// Replaces [`PositionRecord`], which names a page under one pagination and
+/// lives in a directory keyed by where the file sits, so a settings change or
+/// a move loses it.
+///
+/// No panel salt, unlike that record. A page index means nothing on a
+/// differently sized screen and an anchor means the same thing on every one,
+/// so salting this would invent a reason to discard it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaceRecord {
+    /// The copy this place belongs to. Stored in full even though the file
+    /// sits in a directory named from it, so a directory-name collision is
+    /// caught rather than silently handing one book another's place.
+    pub id: crate::identity::BookId,
+    pub anchor: crate::anchor::ContentAnchor,
+}
+
+impl PlaceRecord {
+    pub const ENCODED_LEN: usize = 32;
+    const MAGIC: &'static [u8; 4] = b"X4PL";
+    const VERSION: u8 = 1;
+    const CHECKSUM_AT: usize = 28;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..4].copy_from_slice(Self::MAGIC);
+        out[4] = Self::VERSION;
+        out[5] = crate::anchor::CONTENT_STREAM_VERSION;
+        out[6..22].copy_from_slice(&self.id.to_bytes());
+        let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
+        self.anchor.encode(&mut anchor);
+        out[22..28].copy_from_slice(&anchor);
+        let sum = checksum(&out[..Self::CHECKSUM_AT]);
+        out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// `None` for anything this build cannot read as a place: another magic,
+    /// another record version, a content stream this build does not index the
+    /// same way, or a checksum that fails. Each of those is a place that
+    /// cannot be trusted to name content, and a wrong place is worse than
+    /// opening at the start.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN
+            || &bytes[..4] != Self::MAGIC
+            || bytes[4] != Self::VERSION
+            || bytes[5] != crate::anchor::CONTENT_STREAM_VERSION
+        {
+            return None;
+        }
+        let sum = checksum(&bytes[..Self::CHECKSUM_AT]);
+        if bytes[Self::CHECKSUM_AT..Self::ENCODED_LEN] != sum.to_le_bytes() {
+            return None;
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes[6..22]);
+        let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
+        anchor.copy_from_slice(&bytes[22..28]);
+        Some(Self {
+            id: crate::identity::BookId::from_bytes(id)?,
+            anchor: crate::anchor::ContentAnchor::decode(&anchor),
+        })
+    }
+}
+
 fn checksum(bytes: &[u8]) -> u32 {
     let mut hash = 0x811C_9DC5u32;
     for byte in bytes {

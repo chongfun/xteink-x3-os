@@ -65,6 +65,7 @@ pub(crate) const EMPTY_TOC_RECORD: TocRecord = TocRecord {
     spine_index: -1,
 };
 pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
+    logical_offset: 0,
     section: 0,
     spine: 0,
     start_page: 0,
@@ -1176,6 +1177,57 @@ impl ReaderStore {
             }
         }
         found
+    }
+
+    /// The section holding `anchor`, by the same rule pages follow: the last
+    /// one starting at or before it.
+    ///
+    /// Answered from the book index alone, so resolving a stored place costs
+    /// one section file rather than every section file of the item. `None`
+    /// for a book whose index is not loaded.
+    pub fn section_for_anchor(&self, anchor: ContentAnchor) -> Option<usize> {
+        let mut found = None;
+        for index in 0..self.book_section_count {
+            let record = self.book_sections[index];
+            let start = ContentAnchor::at(record.spine, record.logical_offset);
+            if start <= anchor {
+                found = Some(index);
+            } else {
+                break;
+            }
+        }
+        // A place before the first section is the start of the book, which
+        // the first section holds.
+        found.or(if self.book_section_count > 0 {
+            Some(0)
+        } else {
+            None
+        })
+    }
+
+    /// The anchor of a global page, when that page is in the resident
+    /// window. What a save stores, so the place written is the place the
+    /// reader is looking at.
+    pub fn anchor_for_global_page(&self, global: u32) -> Option<ContentAnchor> {
+        let within = global.checked_sub(self.current_section_start_page)?;
+        self.page_anchor(usize::try_from(within).ok()?)
+    }
+
+    /// One record from the book index.
+    pub fn book_section(&self, index: usize) -> Option<BookV2SectionRecord> {
+        (index < self.book_section_count).then(|| self.book_sections[index])
+    }
+
+    /// The page a stored place opens at, as a global page index.
+    ///
+    /// Two steps because the two live in different files: the book index says
+    /// which section, and only that section's own pages say which page. The
+    /// caller loads the section named by [`section_for_anchor`] before asking.
+    pub fn page_for_anchor(&self, anchor: ContentAnchor) -> Option<u32> {
+        let section = self.section_for_anchor(anchor)?;
+        let record = self.book_sections[section];
+        let within = self.resident_page_containing(anchor)?;
+        Some(record.start_page.saturating_add(within as u32))
     }
 
     /// Record where a page just opened by the build starts. The build appends

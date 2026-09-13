@@ -921,6 +921,60 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
 /// that already run whole SD sessions. `None` when the record is unreadable,
 /// names a root this build does not know, or no longer carries this
 /// identity, in which case no keyed cache access can prove ownership.
+/// Store where the reader is, under the copy's id.
+///
+/// Best effort beside the position write: a copy with no id, a page outside
+/// the resident window, or a directory another id holds leaves the place
+/// unstored, and the position file still carries the page.
+fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    index: usize,
+    screen: u32,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(id) = record_copy_id(root, library, index) else {
+        return;
+    };
+    let Some(anchor) = library.anchor_for_global_page(screen) else {
+        return;
+    };
+    match files::write_place(root, id, anchor) {
+        Ok(()) => {}
+        Err(files::PlaceDenied::Taken) => {
+            esp_println::println!("storage: another copy holds this place directory");
+        }
+        Err(files::PlaceDenied::Fault) => {
+            esp_println::println!("storage: the place write failed");
+        }
+    }
+}
+
+/// The id of the copy at a catalog row, read from the row itself.
+///
+/// The active book's id is resident, and every other row's is not, so this
+/// goes to the card for it. A row with no id yet is a copy adopted by
+/// firmware older than the ledger; it has no place to store and will get one
+/// on the next scan.
+fn record_copy_id<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<proto::identity::BookId>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.active_index() == Some(index) {
+        if let Some(id) = library.active_copy_id() {
+            return Some(id);
+        }
+    }
+    crate::library_sd::read_catalog_record_at(root, index)?.book_id
+}
+
 fn record_location<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
@@ -975,6 +1029,7 @@ pub(crate) fn store_app_state(
                         root: at,
                         locator: path.as_str(),
                     };
+                    store_place(root, library, index, record.screen);
                     match files::write_position_file(root, &owner, record.chapter, record.screen) {
                         Ok(()) => Ok(()),
                         // A full-hash twin's active claim holds the key.
@@ -1046,6 +1101,7 @@ pub(crate) fn store_book_position(
             root: at,
             locator: path.as_str(),
         };
+        store_place(root, library, index as usize, record.screen);
         match files::write_position_file(root, &owner, record.chapter, record.screen) {
             Ok(()) => Ok(()),
             // A twin's active claim holds the key: the departing book's
@@ -1081,12 +1137,14 @@ pub(crate) fn store_global_state(
         .is_some_and(|result| result.is_ok())
 }
 
-/// The saved per-book position for a catalog entry, if any.
+/// Where the reader left off in a catalog entry's copy, as a chapter and a
+/// global page.
 ///
-/// Reads through the legacy-key fallback: a card upgraded across the v8
-/// re-key holds every inactive book's position under its old key, and the
-/// place a reader left off is not rebuildable. The next save publishes
-/// under the current key.
+/// Two lookups, because the place is stored as content: the book index names
+/// the section, that section's page anchors name the page, and neither
+/// depends on the layout the place was written under. A copy with no stored
+/// place falls back to the old page-keyed position, and the next save
+/// publishes a place.
 #[inline(never)]
 pub(crate) fn load_position(
     epd: &mut Epd,
@@ -1104,6 +1162,26 @@ pub(crate) fn load_position(
             root: at,
             locator: path.as_str(),
         };
+        if let Some(id) = record_copy_id(root, library, index) {
+            if let Some(anchor) = files::read_place(root, id) {
+                let section = library
+                    .section_for_anchor(anchor)
+                    .and_then(|section| library.book_section(section));
+                let page = match section {
+                    Some(record) => {
+                        let within =
+                            files::page_of_anchor_in_section(root, &owner, record.spine, anchor)
+                                .unwrap_or(0);
+                        record.start_page.saturating_add(u32::from(within))
+                    }
+                    // No book index yet, so the section that holds the place
+                    // is unknown. The chapter still is, and opening it at its
+                    // first page beats opening the book at its first.
+                    None => 0,
+                };
+                return Some((anchor.spine, page));
+            }
+        }
         files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
     })
     .ok()
@@ -3219,6 +3297,11 @@ where
             start_page: *self.total_pages,
             page_count: self.library.page_count().min(u16::MAX as usize) as u16,
             partial,
+            // Where this section opens, taken from the page that opens it.
+            logical_offset: self
+                .library
+                .page_anchor(0)
+                .map_or(0, |anchor| anchor.offset),
         };
         *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count() as u32);
         *self.section_count += 1;
