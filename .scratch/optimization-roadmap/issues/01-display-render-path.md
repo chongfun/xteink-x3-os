@@ -270,8 +270,8 @@ assumed.**
 | | renders | identical |
 |---|---|---|
 | `bench: render` | 230 | 8 (3.5%) |
-| loading plate | 29 | **29 (100%)** |
-| both | 259 | 37 (14.3%) |
+| loading plate | 32 | **32 (100%)** |
+| both | 262 | 40 (15.3%) |
 
 The compare does not cost one price. It early-exits on the first differing
 byte, so a miss is **14 to 16 µs** and only a hit pays the full scan of the
@@ -307,13 +307,22 @@ item expected:
 - **The end-of-book redraw, 1 hit,** the case the item predicted, confirmed
   at page 302.
 
-**One half of the measurement is still owed.** The item asks for a normal
-session as well as the end-of-book case. The session capture taken
-alongside this ran to 5 renders, because the book was parked at its last
-page by the five-suite run before it, so the 3.5% above is the soak's
-figure and a reading session's own rate is unmeasured. It would have to be
-lower than 0.17% to change the verdict, and the plate hits alone already
-rule that out.
+**Both halves are answered, and the reading rate is the higher one.** The
+soak's own renders split by where the reader was:
+
+| | renders | identical |
+|---|---|---|
+| Ordinary reading, pages 0 to 297 | 172 | 7 (4.1%) |
+| At the book's last page | 4 | 1 (25%) |
+| Library, Home, Chapters | 54 | 0 |
+| Loading plates, two runs | 32 | **32 (100%)** |
+
+So a reading session runs at **4.1%** over 116 distinct pages, better than
+the 3.5% across all renders, and the menus contribute nothing. A dedicated
+`page-turn` session was attempted twice and is not where this figure came
+from: the device resumes book index 0 at page 297 of 303, so both runs met
+the end of the book within six turns. The soak is the larger and more
+varied sample in any case, 116 pages against a session's 50.
 
 **Worth a look while building:** 52,272 bytes compared in 4.6 ms is about
 11 MB/s, slow enough to suggest a byte-wise compare rather than a word-wise
