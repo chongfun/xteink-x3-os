@@ -416,13 +416,29 @@ pub struct PlaceRecord {
     /// caught rather than silently handing one book another's place.
     pub id: crate::identity::BookId,
     pub anchor: crate::anchor::ContentAnchor,
+    /// The source the anchor was resolved against: the cheap per-file
+    /// identity, hash and byte size, that the reader has without hashing
+    /// anything.
+    ///
+    /// Here so a source change is detectable without making the source own
+    /// the place. An offset that still resolves proves nothing about what it
+    /// points at: insert a thousand characters early in a chapter and the old
+    /// offset stays valid and means something else.
+    pub source: (u32, u32),
+    /// How far through the book the reader was, as sixteenths of thousandths
+    /// of the way: 0 at the start, `u16::MAX` at the end.
+    ///
+    /// Fallback, not authority: read only when the source changed under the
+    /// copy, where landing nearby beats landing at page one. Ignored entirely
+    /// while the source still matches.
+    pub progression: u16,
 }
 
 impl PlaceRecord {
-    pub const ENCODED_LEN: usize = 32;
+    pub const ENCODED_LEN: usize = 42;
     const MAGIC: &'static [u8; 4] = b"X4PL";
     const VERSION: u8 = 1;
-    const CHECKSUM_AT: usize = 28;
+    const CHECKSUM_AT: usize = 38;
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -433,9 +449,19 @@ impl PlaceRecord {
         let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
         self.anchor.encode(&mut anchor);
         out[22..28].copy_from_slice(&anchor);
+        out[28..32].copy_from_slice(&self.source.0.to_le_bytes());
+        out[32..36].copy_from_slice(&self.source.1.to_le_bytes());
+        out[36..38].copy_from_slice(&self.progression.to_le_bytes());
         let sum = checksum(&out[..Self::CHECKSUM_AT]);
         out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
         out
+    }
+
+    /// Whether this place was written against the source a reader is holding
+    /// now. False means the bytes changed under the copy, which demotes the
+    /// anchor to a guess and leaves [`progression`](Self::progression).
+    pub fn describes(&self, source: (u32, u32)) -> bool {
+        self.source == source
     }
 
     /// `None` for anything this build cannot read as a place: another magic,
@@ -462,6 +488,11 @@ impl PlaceRecord {
         Some(Self {
             id: crate::identity::BookId::from_bytes(id)?,
             anchor: crate::anchor::ContentAnchor::decode(&anchor),
+            source: (
+                u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+                u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+            ),
+            progression: u16::from_le_bytes([bytes[36], bytes[37]]),
         })
     }
 }

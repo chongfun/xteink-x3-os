@@ -978,7 +978,20 @@ fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     let Some(anchor) = library.anchor_for_global_page(screen) else {
         return;
     };
-    match files::write_place(root, id, anchor) {
+    let Some(entry) = library.catalog_entry(index) else {
+        return;
+    };
+    let total = library.advertised_page_count().max(1);
+    // Where the reader is through the book, for the one case the anchor
+    // cannot answer: the bytes changed under the copy.
+    let progression = ((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)) as u16;
+    match files::write_place(
+        root,
+        id,
+        anchor,
+        (entry.source_hash, entry.byte_size),
+        progression,
+    ) {
         Ok(()) => {}
         Err(files::PlaceDenied::Taken) => {
             esp_println::println!("storage: another copy holds this place directory");
@@ -1200,7 +1213,25 @@ pub(crate) fn load_position(
             locator: path.as_str(),
         };
         if let Some(id) = record_copy_id(root, library, index) {
-            if let Some(anchor) = files::read_place(root, id) {
+            if let Some(place) = files::read_place(root, id) {
+                let anchor = place.anchor;
+                // A place written against other bytes is a guess. The copy
+                // kept its id across the replacement, and the reader's place
+                // in the book it used to hold does not survive the edit that
+                // moved the text: an offset that still resolves says nothing
+                // about what sits there now. So the spine leads and the
+                // progression places the reader inside it, per R13.
+                if !place.describes(identity) {
+                    let total = library.advertised_page_count();
+                    let page = ((u64::from(place.progression) * u64::from(total))
+                        / u64::from(u16::MAX)) as u32;
+                    esp_println::println!(
+                        "restore: the source changed; resuming near {}/{}",
+                        page,
+                        total
+                    );
+                    return Some((anchor.spine, page));
+                }
                 let section = library
                     .section_for_anchor(anchor)
                     .and_then(|section| library.book_section(section));

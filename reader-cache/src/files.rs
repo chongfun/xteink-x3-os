@@ -276,10 +276,17 @@ pub enum PlaceDenied {
 /// The anchor is content, so this survives every layout change and every move
 /// of the file. What it does not survive is the copy being forgotten, which
 /// is the point: a place belongs to a `BookId`.
+///
+/// `source` is the cheap identity of the file the anchor was resolved
+/// against, and `progression` how far through the book the reader was. The
+/// first says whether the anchor still means what it meant; the second is
+/// what a changed source leaves to go on.
 pub fn write_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     id: proto::identity::BookId,
     anchor: proto::anchor::ContentAnchor,
+    source: (u32, u32),
+    progression: u16,
 ) -> Result<(), PlaceDenied>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -297,7 +304,13 @@ where
         &copy,
         PLACE_GENERATIONS,
         PLACE_DURABLE_MAGIC,
-        &proto::nvm::PlaceRecord { id, anchor }.encode(),
+        &proto::nvm::PlaceRecord {
+            id,
+            anchor,
+            source,
+            progression,
+        }
+        .encode(),
     )
     .map_err(|_| PlaceDenied::Fault)
 }
@@ -305,10 +318,13 @@ where
 /// Where the reader left off in this copy, or `None` when nothing legible is
 /// stored for it. A directory holding another copy's id reads as `None` for
 /// the same reason it refuses a write.
+///
+/// The whole record comes back. Whether the anchor can be believed depends on
+/// the source stored beside it, which is the caller's question to ask.
 pub fn read_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     id: proto::identity::BookId,
-) -> Option<proto::anchor::ContentAnchor>
+) -> Option<proto::nvm::PlaceRecord>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -317,7 +333,7 @@ where
     let places = cache_root.open_dir(PLACES_DIR).ok()?;
     let copy = places.open_dir(place_dir_name(id).as_str()).ok()?;
     let record = read_place_in(&copy)?;
-    (record.id == id).then_some(record.anchor)
+    (record.id == id).then_some(record)
 }
 
 fn read_place_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
