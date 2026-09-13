@@ -1278,6 +1278,7 @@ def summarize_paths(
             f"page_turns={len(turn_stats.durations)} "
             f"nav={turn_stats.nav_answered} "
             f"coalesced={turn_stats.coalesced_presses} "
+            f"skipped={turn_stats.skipped_answered} "
             f"unmatched={turn_stats.unmatched_presses} "
             f"reading_renders={turn_stats.reading_renders}"
         )
@@ -1969,7 +1970,12 @@ class PageTurnCounter:
             while self.pending and self.pending[0] <= begin:
                 self.pending.pop(0)
                 answered += 1
-            if answered and event.get("view") == "Reading":
+            # `skipped` excluded for the reason the report excludes it: the
+            # seam sent no frame, so nothing turned. Counting it here would
+            # end a `--turns 50` capture on 49 turns and a no-op at the end
+            # of the book, which is the divergence this class exists to
+            # prevent.
+            if answered and event.get("view") == "Reading" and not event.get("skipped"):
                 self.turns += 1
 
 

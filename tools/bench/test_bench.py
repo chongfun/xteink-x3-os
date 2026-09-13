@@ -1723,6 +1723,32 @@ class PageTurnCounterTests(unittest.TestCase):
             counter.observe(event)
         self.assertEqual(counter.turns, len(bench.page_turn_stats_over_epochs(events).durations))
 
+    def test_the_live_counter_does_not_count_a_skipped_render_either(self) -> None:
+        """A14's guard settles a press without sending a frame, and the two
+        implementations have to agree about that as well. Counting it live
+        would end `--turns N` one real turn short, with the report excluding
+        the same render and printing N-1."""
+        lines = [
+            *self.PRESS_AND_TURN * 2,
+            # The end of the book: the press is answered, the frame matches
+            # the glass, and the seam skips the flush.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
+            (
+                "bench: render view=Reading mode=Fast page=302 chapter=13 layout_ms=5 "
+                "flush_ms=0 req_ms=9000 deq_ms=9001 t_ms=9012 skipped=true\n"
+            ),
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(counter.turns, 2, "the skipped render is not a turn")
+        self.assertEqual(counter.turns, len(stats.durations), "and the two agree")
+        self.assertEqual(stats.presses, 3, "the press still happened")
+        self.assertEqual(stats.skipped_answered, 1)
+        self.assertEqual(stats.unmatched_presses, 0, "and it was answered")
+
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [
             {"event": "run_start", "suite": "page-turn", "requested_page_turns": 50},
@@ -1923,6 +1949,49 @@ class BenchCaptureLoopTests(unittest.TestCase):
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage"), 1)
         self.assertEqual([event["event"] for event in written], ["input", "render", "prestage"])
+
+    def test_a_skipped_render_does_not_satisfy_the_turns_target(self) -> None:
+        """`--turns 2` must not be ended by a no-op at the end of the book.
+
+        Counting the skip live would stop the capture with the report
+        excluding that same render, so the run would end on one real turn
+        and report one against the two asked for.
+        """
+        lines = [
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
+            (
+                "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=10 "
+                "flush_ms=400 req_ms=1000 t_ms=1430\n"
+            ),
+            # The end of the book: answered, but the seam sent no frame.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=3000\n",
+            (
+                "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=5 "
+                "flush_ms=0 req_ms=3000 t_ms=3012 skipped=true\n"
+            ),
+            # A real turn, which is the one that completes the target.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=5000\n",
+            (
+                "bench: render view=Reading mode=Fast page=2 chapter=0 layout_ms=10 "
+                "flush_ms=400 req_ms=5000 t_ms=5430\n"
+            ),
+        ]
+        written: list[dict] = []
+        counts = bench.process_capture_stream(
+            iter(lines),
+            "page-turn",
+            stop_target=("page_turn", 2),
+            print_lines=False,
+            event_callback=written.append,
+        )
+        self.assertEqual(counts.get("page_turn"), 2, "two real turns, not the skip")
+        self.assertEqual(
+            len(bench.page_turn_stats_over_epochs(written).durations),
+            2,
+            "and the report agrees with the count that stopped the capture",
+        )
+        pages = [e.get("page") for e in written if e.get("event") == "render"]
+        self.assertEqual(pages, [1, 1, 2], "the capture ran through the skip to the real turn")
 
     def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
         """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
