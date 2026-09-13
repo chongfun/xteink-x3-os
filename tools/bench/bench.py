@@ -1278,6 +1278,7 @@ def summarize_paths(
             f"page_turns={len(turn_stats.durations)} "
             f"nav={turn_stats.nav_answered} "
             f"coalesced={turn_stats.coalesced_presses} "
+            f"skipped={turn_stats.skipped_answered} "
             f"unmatched={turn_stats.unmatched_presses} "
             f"reading_renders={turn_stats.reading_renders}"
         )
@@ -1772,10 +1773,19 @@ class PageTurnStats:
     # constant above — these are the burst signal, and the reason the median
     # cannot be trusted on unmatched count alone.
     coalesced_presses: int
+    # Presses answered by a render the flush seam skipped: answered, so not
+    # unmatched, but no frame was sent so they are not turns either.
+    skipped_answered: int = 0
 
     @property
     def unmatched_presses(self) -> int:
-        return self.presses - len(self.durations) - self.nav_answered - self.coalesced_presses
+        return (
+            self.presses
+            - len(self.durations)
+            - self.nav_answered
+            - self.coalesced_presses
+            - self.skipped_answered
+        )
 
     @property
     def untrusted_presses(self) -> int:
@@ -1863,6 +1873,7 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     reading_renders = 0
     nav_answered = 0
     coalesced_presses = 0
+    skipped_answered = 0
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
         if name == "input" and press_action(event) in {"Next", "Previous"}:
@@ -1889,10 +1900,25 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 continue
             coalesced_presses += answered - 1
             if is_reading:
-                durations.append(t_ms - newest_answered)
+                # A skipped render sent no frame, so it is not a turn and
+                # its ~12 ms would pull the median under the floor that
+                # catches presses paired against renders already in flight.
+                # The press still counts and is still answered; only the
+                # duration is left out.
+                if event.get("skipped"):
+                    skipped_answered += 1
+                else:
+                    durations.append(t_ms - newest_answered)
             else:
                 nav_answered += 1
-    return PageTurnStats(durations, presses, reading_renders, nav_answered, coalesced_presses)
+    return PageTurnStats(
+        durations,
+        presses,
+        reading_renders,
+        nav_answered,
+        coalesced_presses,
+        skipped_answered,
+    )
 
 
 class PageTurnCounter:
@@ -1958,7 +1984,12 @@ class PageTurnCounter:
             while self.pending and self.pending[0] <= begin:
                 self.pending.pop(0)
                 answered += 1
-            if answered and event.get("view") == "Reading":
+            # `skipped` excluded for the reason the report excludes it: the
+            # seam sent no frame, so nothing turned. Counting it here would
+            # end a `--turns 50` capture on 49 turns and a no-op at the end
+            # of the book, which is the divergence this class exists to
+            # prevent.
+            if answered and event.get("view") == "Reading" and not event.get("skipped"):
                 self.turns += 1
 
 
@@ -2066,7 +2097,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
     pooled figure is exactly its parts and coverage can be judged per part
     without measuring anything twice.
     """
-    merged = PageTurnStats([], 0, 0, 0, 0)
+    merged = PageTurnStats([], 0, 0, 0, 0, 0)
     for stats in parts:
         merged = PageTurnStats(
             merged.durations + stats.durations,
@@ -2074,6 +2105,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
             merged.reading_renders + stats.reading_renders,
             merged.nav_answered + stats.nav_answered,
             merged.coalesced_presses + stats.coalesced_presses,
+            merged.skipped_answered + stats.skipped_answered,
         )
     return merged
 
