@@ -209,7 +209,7 @@ waveform, no register, no byte on the wire changes.
 - Risk: low. The only failure mode is an implementation that *drops* the
   delay instead of deferring it.
 
-### A14 (S–M): nothing compares a frame against what is already on the glass
+### A14 (LANDED as #98, 2026-09-12): nothing compared a frame against what was already on the glass
 
 The display task already keeps `prev_fb`, a byte-exact copy of the displayed
 frame, maintained after every successful flush. A single
@@ -256,6 +256,17 @@ can never disagree with `prev_fb` on the skip path.
   safe predicate restricts to `Fast`. If they turn out byte-identical,
   either the restriction costs A14 its most common case or the boot and wake
   double-paint is a separate item.
+
+**Shipped 2026-09-12 as #98.** The predicate is the one specified below.
+On the X3 one soak skipped 8 renders and 29 of 29 loading plates, all
+`Fast`, `flush_ms` 0 where it was 332, about 12.3 s of panel time in a
+single run; a 50-turn page turn was unchanged at 355 ms median against 353
+before, since ordinary turns still flush. `RefreshPlanner` gained
+`record_skipped_render` so a skip updates what is displayed without moving
+the count that schedules `FullEveryTen`'s cleans. One harness change came
+with it: a skipped render settles a press in about 12 ms without turning a
+page, so it is counted as answered in its own bucket and kept out of both
+the turn population and the live `--turns` count.
 
 **The measurement was taken, 2026-09-12, on main `0fdde34`.** `identical`
 and `cmp_us` were added to `bench: render`, and a `bench: plate` line to the
