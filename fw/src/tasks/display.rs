@@ -453,20 +453,41 @@ pub async fn run(
                         mode
                     );
                 }
+                // A frame the panel already shows costs 435 ms to send and
+                // changes nothing. The compare early-exits on the first
+                // differing byte, so the ordinary case is 14 to 16 us and
+                // only a match pays the full scan, measured at 4.6 ms.
+                //
+                // Restricted to `Fast` so a deliberate ghost-clearing pass
+                // still runs. `last_request` must be set, which a failed
+                // flush and a sleep both clear, so the panel cannot disagree
+                // with `prev_fb` here.
+                let skipped = refresh_planner.screen_on()
+                    && refresh_planner.last_request().is_some()
+                    && mode == RefreshMode::Fast
+                    && fb.bytes() == prev_fb.bytes();
                 let flush_start = Instant::now();
-                if let Ok(settle) = display_flush::flush(
-                    &mut epd,
-                    fb,
-                    prev_fb,
-                    refresh_planner.screen_on(),
-                    mode,
-                    prev_prestaged,
-                )
-                .await
-                {
+                let flushed = if skipped {
+                    Ok(display_flush::PanelSettle::from_ms(0))
+                } else {
+                    display_flush::flush(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        refresh_planner.screen_on(),
+                        mode,
+                        prev_prestaged,
+                    )
+                    .await
+                };
+                if let Ok(settle) = flushed {
                     let flush_ms = flush_start.elapsed().as_millis();
-                    refresh_planner.record_render(request, mode);
-                    prev_fb.copy_from(fb);
+                    if skipped {
+                        refresh_planner.record_skipped_render(request);
+                    } else {
+                        refresh_planner.record_render(request, mode);
+                        prev_fb.copy_from(fb);
+                    }
                     // Keep the current chapter tracking the page just shown, past
                     // the reducer's 128-chapter cap. Cheap in-RAM check; only the
                     // loaded SD reader has an uncapped page map, so this no-ops on
@@ -505,7 +526,7 @@ pub async fn run(
                     // write they never waited on: `Settled` has already gone
                     // out, and press-to-settled ends on this line.
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={}",
                         request.view,
                         mode,
                         request.page,
@@ -515,6 +536,7 @@ pub async fn run(
                         request.requested_at_ms,
                         dequeued_at_ms,
                         settled_at_ms,
+                        skipped,
                     );
                     // The clean plans' settle, deferred out of the flush so it
                     // falls after `Settled`. It guards the prestage below and
@@ -522,32 +544,43 @@ pub async fn run(
                     // it rather than after it, so the gap cannot shrink while
                     // 200 ms comes off press-to-settled. Zero on other plans.
                     settle.wait().await;
-                    let prestage_start = Instant::now();
-                    // Unconditional, deliberately. Skipping this write when another
-                    // render is already queued reads like a saving and is the exact
-                    // opposite: it is off the critical path here — Settled has gone
-                    // out, the glass is done, nobody is waiting — while the write it
-                    // defers lands *inside* the next Fast flush, ahead of
-                    // DisplayRefresh, where the reader does wait.
-                    // `fast_plan_only_writes_previous_plane_when_not_prestaged`
-                    // (display/src/epd/uc8253.rs) pins the asymmetry: an unstaged
-                    // Fast carries an extra WritePlane(Old, Previous) + DataStop,
-                    // and the X4 writes RED from `prev_fb` for the same reason
-                    // (fw/src/display_flush/ssd1677.rs). The skip is also
-                    // self-sustaining — each skipped turn leaves the next unstaged —
-                    // so a held button would pay the write on-path every turn
-                    // instead of off-path once.
-                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
-                    // Its own event, after the render one above: prestage is
-                    // real work on this task and still gates the next command,
-                    // but it sits outside press-to-settled and is measured
-                    // separately so neither number can absorb the other.
-                    bench_log!(
-                        "bench: prestage staged={} elapsed_ms={} t_ms={}",
-                        prev_prestaged,
-                        prestage_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
+                    // Skipped renders own none of this: nothing wrote panel
+                    // RAM, so `prev_prestaged` is still true of the frame it
+                    // was true of, and staging again would copy a frame the
+                    // panel already holds.
+                    if !skipped {
+                        let prestage_start = Instant::now();
+                        // Runs for every frame that reached the panel, and a
+                        // queued next render is no reason to defer it. This
+                        // write is off the critical path here, with Settled
+                        // already out, while the write it would defer lands
+                        // inside the next Fast flush where the reader waits.
+                        // `fast_plan_only_writes_previous_plane_when_not_prestaged`
+                        // (display/src/epd/uc8253.rs) pins the asymmetry: an
+                        // unstaged Fast carries an extra WritePlane(Old,
+                        // Previous) + DataStop, and the X4 writes RED from
+                        // `prev_fb` for the same reason
+                        // (fw/src/display_flush/ssd1677.rs). Deferring is also
+                        // self-sustaining, since each deferral leaves the next
+                        // turn unstaged, so a held button would pay the write
+                        // on-path every turn instead of off-path once.
+                        //
+                        // The skip above is the one case that owes nothing,
+                        // and for the opposite reason: it wrote no panel RAM,
+                        // so the staging still standing is still correct.
+                        prev_prestaged =
+                            display_flush::prestage_previous(&mut epd, fb).await.is_ok();
+                        // Its own event, after the render one above: prestage is
+                        // real work on this task and still gates the next command,
+                        // but it sits outside press-to-settled and is measured
+                        // separately so neither number can absorb the other.
+                        bench_log!(
+                            "bench: prestage staged={} elapsed_ms={} t_ms={}",
+                            prev_prestaged,
+                            prestage_start.elapsed().as_millis(),
+                            Instant::now().as_millis(),
+                        );
+                    }
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
@@ -834,7 +867,23 @@ pub async fn run(
                         ) {
                             crate::views::render(fb, loading_request, sd_library);
                             let mode = refresh_planner.mode_for(loading_request);
-                            if let Ok(settle) = display_flush::flush(
+                            // The plate draws the Reading view for the page
+                            // being built, which is often the page already on
+                            // the glass: an extend of the section in front of
+                            // the reader repaints what they are looking at.
+                            // Measured 32 of 32 identical over two device
+                            // runs, 435 ms each. Nobody waits on the plate, so
+                            // a skip owes no event and no planner update.
+                            if refresh_planner.screen_on()
+                                && refresh_planner.last_request().is_some()
+                                && mode == RefreshMode::Fast
+                                && fb.bytes() == prev_fb.bytes()
+                            {
+                                bench_log!(
+                                    "bench: plate skipped=true t_ms={}",
+                                    Instant::now().as_millis(),
+                                );
+                            } else if let Ok(settle) = display_flush::flush(
                                 &mut epd,
                                 fb,
                                 prev_fb,

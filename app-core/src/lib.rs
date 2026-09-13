@@ -255,6 +255,18 @@ impl RefreshPlanner {
         }
     }
 
+    /// Records a render the flush seam skipped because the frame already
+    /// matched the glass.
+    ///
+    /// Deliberately not a `record_render` with a different mode: no waveform
+    /// ran, so `fast_refreshes` must not move, or `FullEveryTen`'s cleans
+    /// drift earlier for refreshes nothing drove. `screen_on` is left alone
+    /// because the skip predicate already requires it.
+    pub fn record_skipped_render(&mut self, request: RenderRequest) {
+        self.last_request = Some(request);
+        self.panel_shows_sleep_screen = false;
+    }
+
     /// Records the panel powering down at the end of the sleep handshake.
     /// Clearing `last_request` is what makes the next render re-init the
     /// panel, so this must run whenever the panel actually slept — even if
@@ -6725,6 +6737,57 @@ mod tests {
         // firmware drew, so wake also needs only the one-flicker clean.
         planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
+    fn a_skipped_render_updates_what_is_displayed_without_counting_a_refresh() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.refresh_policy = RefreshPolicy::FullEveryTen;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+
+        // One short of the clean, so the next counted Fast would trip it.
+        for _ in 0..DEFAULT_FULL_REFRESH_INTERVAL - 1 {
+            planner.record_render(request, RefreshMode::Fast);
+        }
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+
+        // A skip drove no waveform, so it leaves the count where it was.
+        // Any number of them do.
+        for _ in 0..20 {
+            planner.record_skipped_render(request);
+            assert_eq!(
+                planner.mode_for(request),
+                RefreshMode::Fast,
+                "a skipped render must not drift the clean earlier",
+            );
+        }
+
+        // And the next real Fast still trips it on schedule.
+        planner.record_render(request, RefreshMode::Fast);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
+    fn a_skipped_render_still_says_what_the_panel_shows() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        let boot = state.render_request(RenderKind::Boot);
+        planner.record_render(boot, RefreshMode::Full);
+
+        state.selection = 1;
+        let moved = state.render_request(RenderKind::Page);
+        planner.record_skipped_render(moved);
+        assert_eq!(
+            planner.last_request(),
+            Some(moved),
+            "the planner models the frame the seam settled on, flushed or not",
+        );
+        assert!(planner.screen_on(), "a skip leaves the screen lit");
+        // Not a cold boot afterwards: the panel's contents are known, so the
+        // next render keeps its ordinary mode rather than the deep waveform.
+        assert_ne!(planner.mode_for(moved), RefreshMode::Full);
     }
 
     #[test]

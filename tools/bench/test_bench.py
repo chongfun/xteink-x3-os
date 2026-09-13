@@ -3509,6 +3509,34 @@ class CountAndDurationContractTests(unittest.TestCase):
         )
         return events
 
+    def test_a_skipped_render_is_answered_but_is_not_a_turn(self) -> None:
+        """A14's frame-identity guard settles a press without sending a
+        frame. The press is answered, so it is not unmatched, but nothing
+        turned and its ~12 ms must stay out of the turn population."""
+        events = [
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1350, "req_ms": 1000, "deq_ms": 1001},
+            {"event": "input", "button": "Next", "t_ms": 2000},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 2012,
+                "req_ms": 2000,
+                "deq_ms": 2001,
+                "skipped": True,
+            },
+        ]
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(stats.durations, [350], "the skipped render is not a turn")
+        self.assertEqual(stats.presses, 2, "both presses still count")
+        self.assertEqual(stats.skipped_answered, 1, "the skipped press has its own bucket")
+        self.assertEqual(stats.unmatched_presses, 0, "and both presses were answered")
+        self.assertEqual(stats.untrusted_fraction, 0.0, "a skip is not a trust problem")
+
+        # A capture from a build without the field reads as it always did.
+        older = [{k: v for k, v in e.items() if k != "skipped"} for e in events]
+        self.assertEqual(bench.page_turn_stats_over_epochs(older).durations, [350, 12])
+
     def test_the_count_landing_first_is_a_clean_pass(self) -> None:
         """`--turns 3 --seconds 600`, done in twelve seconds."""
         events = self._page_turn_run(3, 3, 12.0, "count")
