@@ -151,6 +151,7 @@ where
         let pruned = files::prune_orphan_sections(
             root,
             cache_key,
+            library.layout_key(),
             sections_slice.len().min(u16::MAX as usize) as u16,
         );
         if pruned > 0 {

@@ -315,7 +315,21 @@ fn total_pages(records: &[BookV2SectionRecord]) -> u32 {
 /// the question the round-2 finding turned on: a failing publish must not take
 /// the files out from under a reader who is reading them.
 fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
-    (0..count).all(|n| file_in_sections_dir(root, &format!("S{n:03}.BIN")))
+    (0..count).all(|n| file_in_sections_dir(root, &section_name(n as u16)))
+}
+
+/// The name a section file takes under the store's default layout, which is
+/// the layout every test in this file builds under.
+fn section_name(section: u16) -> String {
+    let mut name = heapless::String::<{ proto::cache::CACHE_SECTION_FILE_BYTES }>::new();
+    proto::cache::section_file_name(default_layout_key(), section, &mut name);
+    name.as_str().into()
+}
+
+/// Taken from a store rather than assumed, so the fixture and the writer
+/// cannot disagree about which layout named the files.
+fn default_layout_key() -> u8 {
+    new_store().layout_key()
 }
 
 /// Whether one named file exists in the book's `SECTIONS/` directory.
@@ -704,7 +718,8 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
         "the sections the new index names must survive"
     );
     assert!(
-        !file_in_sections_dir(&root, "S003.BIN") && !file_in_sections_dir(&root, "S004.BIN"),
+        !file_in_sections_dir(&root, &section_name(3))
+            && !file_in_sections_dir(&root, &section_name(4)),
         "the sections the new index no longer names must be gone"
     );
 }
@@ -781,7 +796,7 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
 
     assert!(
-        !file_in_sections_dir(&root, "S001.BIN"),
+        !file_in_sections_dir(&root, &section_name(1)),
         "the orphaned section should still go"
     );
     assert!(
@@ -817,10 +832,11 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
     assert!(sections_still_on_card(&root, 5));
 
     disk.fault.fail_write_in.set(Some(0));
-    let removed = files::prune_orphan_sections(&root, &OWNER, 2);
+    let removed = files::prune_orphan_sections(&root, &OWNER, default_layout_key(), 2);
 
     assert!(
-        file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
+        file_in_sections_dir(&root, &section_name(0))
+            && file_in_sections_dir(&root, &section_name(1)),
         "the sections the index still names must survive"
     );
     assert_eq!(
@@ -828,9 +844,9 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
         "every orphan must come off the card, including the one behind the refused write"
     );
     assert!(
-        !file_in_sections_dir(&root, "S002.BIN")
-            && !file_in_sections_dir(&root, "S003.BIN")
-            && !file_in_sections_dir(&root, "S004.BIN"),
+        !file_in_sections_dir(&root, &section_name(2))
+            && !file_in_sections_dir(&root, &section_name(3))
+            && !file_in_sections_dir(&root, &section_name(4)),
         "a refused delete must not strand the orphans after it"
     );
 }

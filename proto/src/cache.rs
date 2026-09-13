@@ -49,7 +49,7 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 8;
+pub const CACHE_SECTION_FILE_BYTES: usize = 10;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -956,11 +956,36 @@ pub fn legacy_position_cache_key(
     Some(out)
 }
 
-pub fn section_file_name<const N: usize>(spine: u16, out: &mut String<N>) {
+/// One section's file, named for the layout that paginated it as well as the
+/// spine item it holds, so two layouts of one book sit side by side rather
+/// than overwriting each other.
+pub fn section_file_name<const N: usize>(layout: u8, spine: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
+    push_hex(out, u32::from(layout), 2);
     push_dec3(out, spine);
     let _ = out.push_str(".BIN");
+}
+
+/// The book index for one layout. Paginated alongside the sections and just
+/// as layout-bound: it holds the page totals and where each section starts.
+pub fn book_file_name<const N: usize>(layout: u8, out: &mut String<N>) {
+    out.clear();
+    let _ = out.push('B');
+    push_hex(out, u32::from(layout), 2);
+    let _ = out.push_str(".BIN");
+}
+
+/// Whether a name in a book's SECTIONS directory belongs to `layout`.
+/// Used by the sweep that retires one layout without touching the others.
+pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
+    let mut expect = String::<4>::new();
+    let _ = expect.push('S');
+    push_hex(&mut expect, u32::from(layout), 2);
+    name.len() > expect.len() && name.is_char_boundary(expect.len()) && {
+        let (head, _) = name.split_at(expect.len());
+        head.eq_ignore_ascii_case(expect.as_str())
+    }
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -2200,10 +2225,16 @@ mod tests {
         assert!(key.as_str()[1..].bytes().all(|b| b.is_ascii_hexdigit()));
 
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-        section_file_name(7, &mut name);
-        assert_eq!(name.as_str(), "S007.BIN");
-        section_file_name(1234, &mut name);
-        assert_eq!(name.as_str(), "S999.BIN");
+        section_file_name(0x2A, 7, &mut name);
+        assert_eq!(name.as_str(), "S2A007.BIN");
+        section_file_name(0x2A, 1234, &mut name);
+        assert_eq!(name.as_str(), "S2A999.BIN");
+        // One book, two layouts, two sets of files.
+        let mut other = String::<CACHE_SECTION_FILE_BYTES>::new();
+        section_file_name(0x2B, 7, &mut other);
+        assert_ne!(name.as_str(), other.as_str());
+        assert!(section_file_is_layout(other.as_str(), 0x2B));
+        assert!(!section_file_is_layout(other.as_str(), 0x2A));
     }
 
     /// The identity input is the full location, not the 64-byte display

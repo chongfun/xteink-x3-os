@@ -615,6 +615,22 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
         | settings.spacing as u16
 }
 
+/// The part of the layout that names a stored pagination.
+///
+/// The wrap-point inputs only: size, weight, family, and the page box. Two
+/// layouts differing in any of those break pages in different places, so the
+/// cache names them apart and keeps both.
+///
+/// Line spacing stays out. A spacing change re-walks heights over the same
+/// wrap points, so both spacings share one stored set and the header check
+/// sorts them out. The wrap-rule version and panel salt stay out because a
+/// bump must retire every layout, which each index's own header does by
+/// rejecting itself; in the name it would strand a fresh set of files with no
+/// reader left to delete the old one.
+pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
+    ((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8
+}
+
 /// The reading body face for the given settings and style run.
 pub fn body_font(settings: TypeSettings, style: FontStyle) -> &'static BitmapFont {
     family_weighted(settings.family, settings.size, settings.weight, style)

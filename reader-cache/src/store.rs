@@ -1205,6 +1205,11 @@ impl ReaderStore {
         })
     }
 
+    /// Which stored pagination this store's current settings name.
+    pub fn layout_key(&self) -> u8 {
+        ui::reading::layout_key(self.type_settings(), self.portrait())
+    }
+
     /// The anchor of a global page, when that page is in the resident
     /// window. What a save stores, so the place written is the place the
     /// reader is looking at.

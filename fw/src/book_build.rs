@@ -1169,9 +1169,14 @@ pub(crate) fn load_position(
                     .and_then(|section| library.book_section(section));
                 let page = match section {
                     Some(record) => {
-                        let within =
-                            files::page_of_anchor_in_section(root, &owner, record.spine, anchor)
-                                .unwrap_or(0);
+                        let within = files::page_of_anchor_in_section(
+                            root,
+                            &owner,
+                            library.layout_key(),
+                            record.spine,
+                            anchor,
+                        )
+                        .unwrap_or(0);
                         record.start_page.saturating_add(u32::from(within))
                     }
                     // No book index yet, so the section that holds the place

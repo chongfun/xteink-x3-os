@@ -1902,16 +1902,22 @@ where
     cleared
 }
 
-/// The section ordinal a `S###.BIN` name encodes, or `None` for any other
-/// name. Parsed rather than trusted: `SECTIONS/` is on removable media, so a
-/// name that is not one of ours must be left alone, not miscounted into the
-/// prune range.
-fn section_ordinal_from_name(name: &str) -> Option<u16> {
+/// The section ordinal a `S<layout><###>.BIN` name encodes, when the name
+/// belongs to `layout`. `None` for any other name, including one belonging to
+/// a different layout.
+///
+/// Parsed rather than trusted: `SECTIONS/` is on removable media, so a name
+/// that is not one of ours is left alone rather than miscounted into the
+/// prune range. Another layout's files count as not ours, since a prune for
+/// one layout must leave the others where they are.
+fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
+    if !proto::cache::section_file_is_layout(name, layout) {
+        return None;
+    }
     let digits = name
-        .strip_prefix(['S', 's'])?
-        .get(..3)
+        .get(3..6)
         .filter(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))?;
-    let suffix = name.get(4..)?;
+    let suffix = name.get(6..)?;
     if !suffix.eq_ignore_ascii_case(".BIN") {
         return None;
     }
@@ -1954,6 +1960,7 @@ fn prune_orphan_sections_in<
     const MAX_VOLUMES: usize,
 >(
     sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout: u8,
     keep_count: u16,
 ) -> usize
 where
@@ -1984,7 +1991,7 @@ where
                 if write!(name, "{}", entry.name).is_err() {
                     return ControlFlow::Continue(());
                 }
-                match section_ordinal_from_name(name.as_str()) {
+                match section_ordinal_from_name(name.as_str(), layout) {
                     Some(ordinal) if ordinal >= keep_count => {
                         let _ = names.push(name);
                     }
@@ -2039,6 +2046,7 @@ pub fn prune_orphan_sections<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout: u8,
     keep_count: u16,
 ) -> usize
 where
@@ -2046,7 +2054,7 @@ where
     T: TimeSource,
 {
     with_v2_sections_dir(root, owner, |sections| match sections {
-        Some(sections) => prune_orphan_sections_in(sections, keep_count),
+        Some(sections) => prune_orphan_sections_in(sections, layout, keep_count),
         None => 0,
     })
 }
@@ -2344,6 +2352,7 @@ where
     let result = load_v2_section_cache(
         root,
         owner,
+        library.layout_key(),
         source_identity,
         section.section,
         section.spine,
@@ -2353,7 +2362,14 @@ where
     if let CacheLoadResult::Hit { pages, repaginated } = result {
         library.set_current_section_range(section.start_page, pages);
         if repaginated {
-            let _ = write_v2_section_cache(root, owner, source_identity, section.section, library);
+            let _ = write_v2_section_cache(
+                root,
+                owner,
+                library.layout_key(),
+                source_identity,
+                section.section,
+                library,
+            );
         }
     }
     result
@@ -2383,6 +2399,9 @@ where
     }
 }
 
+// The section's identity is spread across its arguments: which book, which
+// layout, which bytes, which section, and where to put it.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn load_v2_section_cache<
     D,
     T,
@@ -2392,6 +2411,7 @@ pub(crate) fn load_v2_section_cache<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     source_identity: (u32, u32),
     section: u16,
     expected_spine: u16,
@@ -2402,7 +2422,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, owner, section, Mode::ReadOnly, |file| {
+    with_v2_section_file(root, owner, layout_key, section, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return CacheLoadResult::Invalid;
@@ -2456,6 +2476,7 @@ pub(crate) fn write_v2_section_cache<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     source_identity: (u32, u32),
     section: u16,
     library: &ReaderStore,
@@ -2471,6 +2492,7 @@ where
     with_v2_section_file(
         root,
         owner,
+        layout_key,
         section,
         Mode::ReadWriteCreateOrTruncate,
         |file| write_v2_section_body(file, source_identity, library.cached_spine, library),
@@ -2540,7 +2562,7 @@ where
     T: TimeSource,
 {
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(section, &mut name);
+    section_file_name(library.layout_key(), section, &mut name);
     match sections.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate) {
         Ok(file) => write_v2_section_body(&file, source_identity, library.cached_spine, library),
         Err(_) => {
@@ -3444,6 +3466,7 @@ fn with_v2_section_file<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     spine: u16,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
@@ -3455,7 +3478,7 @@ where
     let book_dir = open_v2_book_dir(root, owner)?;
     let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(spine, &mut name);
+    section_file_name(layout_key, spine, &mut name);
     let file = sections.open_file_in_dir(name.as_str(), mode).ok()?;
     Some(f(&file))
 }
@@ -3474,6 +3497,7 @@ pub fn page_of_anchor_in_section<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     spine: u16,
     anchor: proto::anchor::ContentAnchor,
 ) -> Option<u16>
@@ -3481,7 +3505,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, owner, spine, Mode::ReadOnly, |file| {
+    with_v2_section_file(root, owner, layout_key, spine, Mode::ReadOnly, |file| {
         let mut header = [0u8; SECTION_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header).is_err() {
             return None;
