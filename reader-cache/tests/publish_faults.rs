@@ -984,6 +984,107 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
 /// Position is the one non-rebuildable thing under a key, so the new lookup
 /// must recover it from the old directory; a mutation that drops the legacy
 /// layer resumes every such book at the beginning.
+/// Write one section file under a layout that is not the store's, by moving
+/// the store to those settings for the write and back afterwards. Stands in
+/// for the reader having used that configuration earlier.
+fn write_section_under(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    portrait: bool,
+    section: u16,
+) -> u8 {
+    let settings = store.type_settings();
+    let was_portrait = store.portrait();
+    store.set_layout(settings, portrait);
+    let key = store.layout_key();
+    write_section(root, store, section, 0);
+    store.set_layout(settings, was_portrait);
+    key
+}
+
+/// R9, the flow the milestone exists for: A, then B, then back to A, with A's
+/// pagination still on the card.
+#[test]
+fn a_second_layout_does_not_take_the_first_ones_pagination() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let landscape = write_section_under(&root, &mut store, false, 0);
+    let portrait = write_section_under(&root, &mut store, true, 0);
+    assert_ne!(landscape, portrait, "the page box names a layout apart");
+
+    let mut resident = files::resident_layouts(&root, &OWNER);
+    resident.sort_unstable();
+    let mut expected = [landscape, portrait];
+    expected.sort_unstable();
+    assert_eq!(
+        resident.as_slice(),
+        &expected[..],
+        "both layouts keep their own pagination"
+    );
+}
+
+/// R10: the bound is on stored layouts, and a third arriving evicts one.
+/// Nothing evicts merely because a layout stopped being current.
+#[test]
+fn a_third_layout_evicts_one_and_only_then() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    let second = write_section_under(&root, &mut store, true, 0);
+    assert_eq!(files::resident_layouts(&root, &OWNER).len(), 2);
+
+    // Re-opening one of the two evicts nothing: it is already resident.
+    assert!(files::evict_layouts_for(&root, &OWNER, first));
+    assert_eq!(
+        files::resident_layouts(&root, &OWNER).len(),
+        2,
+        "a layout already on the card costs nothing to open"
+    );
+
+    // A third makes room, and the one that goes is not the one arriving.
+    let third = first.wrapping_add(64).max(1);
+    assert!(files::evict_layouts_for(&root, &OWNER, third));
+    let left = files::resident_layouts(&root, &OWNER);
+    assert_eq!(left.len(), 1, "one of the two was evicted");
+    assert!(
+        left.contains(&first) || left.contains(&second),
+        "and the survivor is one of the two that were there"
+    );
+    assert!(!left.contains(&third), "the arriving layout writes its own");
+}
+
+/// R11: pagination is derived and a place is not. Evicting every layout of a
+/// book leaves the reader's place where it was.
+#[test]
+fn evicting_pagination_leaves_the_place_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let id = book_id(11);
+    let anchor = proto::anchor::ContentAnchor::at(2, 900);
+    files::write_place(&root, id, anchor).expect("the place stores");
+
+    let layout = write_section_under(&root, &mut store, false, 0);
+    assert!(files::empty_layout_cache(&root, KEY, layout));
+    assert!(files::resident_layouts(&root, &OWNER).is_empty());
+    assert_eq!(
+        files::read_place(&root, id),
+        Some(anchor),
+        "the place is not pagination and does not go with it"
+    );
+}
+
 fn book_id(seed: u8) -> proto::identity::BookId {
     proto::identity::BookId::from_bytes([seed; 16]).expect("a non-zero id")
 }

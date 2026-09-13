@@ -976,16 +976,38 @@ pub fn book_file_name<const N: usize>(layout: u8, out: &mut String<N>) {
     let _ = out.push_str(".BIN");
 }
 
+/// The layout a section file's name says made it, or `None` for a name that is
+/// not one of ours. Over bytes, for the reason below.
+pub fn layout_of_section_file(name: &str) -> Option<u8> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 6 || !bytes[0].eq_ignore_ascii_case(&b'S') {
+        return None;
+    }
+    let high = (bytes[1] as char).to_digit(16)?;
+    let low = (bytes[2] as char).to_digit(16)?;
+    if !bytes[3..6].iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if !bytes.get(6..)?.eq_ignore_ascii_case(b".BIN") {
+        return None;
+    }
+    Some((high * 16 + low) as u8)
+}
+
 /// Whether a name in a book's SECTIONS directory belongs to `layout`.
-/// Used by the sweep that retires one layout without touching the others.
+/// Used by the sweep that retires one layout and leaves the others alone.
+///
+/// Compared over bytes, not over `&str` offsets. A FAT short name reaches
+/// this as text the driver wrote one byte at a time, so a byte at or above
+/// 0x80 becomes two UTF-8 bytes and shifts every character boundary past it.
+/// Slicing at computed offsets then reads the wrong field, or panics.
 pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
+    let bytes = name.as_bytes();
     let mut expect = String::<4>::new();
     let _ = expect.push('S');
     push_hex(&mut expect, u32::from(layout), 2);
-    name.len() > expect.len() && name.is_char_boundary(expect.len()) && {
-        let (head, _) = name.split_at(expect.len());
-        head.eq_ignore_ascii_case(expect.as_str())
-    }
+    let expect = expect.as_bytes();
+    bytes.len() > expect.len() && bytes[..expect.len()].eq_ignore_ascii_case(expect)
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {

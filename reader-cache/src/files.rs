@@ -1833,6 +1833,300 @@ where
     cleared
 }
 
+/// Clear one layout's pagination and the index that named it, leaving every
+/// other layout, the content cache, the TOC, the cover and the claim alone.
+///
+/// The narrow form of [`empty_cache_dir`], for the failure paths that have to
+/// throw away a half-written index. Emptying the whole directory there was
+/// right while a book had one cache; with two it takes the other layout's
+/// finished work as collateral, and it takes `CONT.BIN` with it, which turns
+/// the next open from a replay into a full re-parse of the EPUB.
+///
+/// Reports whether everything it meant to remove is gone.
+/// How many layouts of one book keep their pagination.
+///
+/// Two, because the flow that hurts is the flip and the flip back. A third
+/// costs another paginated copy of the whole book on the card for a
+/// configuration the reader has left.
+pub const MAX_RESIDENT_LAYOUTS: usize = 2;
+
+/// The layouts this book has section files for, read off the card.
+///
+/// Listed rather than recorded. A record of what is resident can drift from
+/// what is there, and R10 is explicit that a record claiming an eviction that
+/// did not happen loses the storage bound entirely: the files still load,
+/// nothing counts them, and no later pass looks. The directory cannot lie
+/// about itself.
+pub fn resident_layouts<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> heapless::Vec<u8, 16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut found: heapless::Vec<u8, 16> = heapless::Vec::new();
+    with_v2_sections_dir(root, owner, |sections| {
+        let Some(sections) = sections else {
+            return;
+        };
+        let _ = sections.iterate_dir(|entry| {
+            if entry.attributes.is_directory() || found.is_full() {
+                return ControlFlow::Continue(());
+            }
+            let mut name = String::<SHORT_NAME_BYTES>::new();
+            if write!(name, "{}", entry.name).is_err() {
+                return ControlFlow::Continue(());
+            }
+            if let Some(layout) = proto::cache::layout_of_section_file(name.as_str()) {
+                if !found.contains(&layout) {
+                    let _ = found.push(layout);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+    });
+    found
+}
+
+/// Make room for `keep` among this book's stored layouts.
+///
+/// Runs before a layout's first index is written, which is the only moment a
+/// book gains one, and only then: eviction that fired on every open would be
+/// "this layout is not the current layout", the rule R10 forbids.
+///
+/// The index goes before the sections. An interrupted eviction then leaves
+/// sections with no index, which reads as nothing and rebuilds, rather than an
+/// index promising sections that are gone.
+///
+/// Reports whether the card is now within the bound. `false` means a delete
+/// was refused and the layout it named is still counted, so the next open
+/// tries again. The caller goes on to build either way: eviction only runs
+/// when a build was going to happen, so refusing the open over a failed delete
+/// would refuse a book because the card would not free a file.
+pub fn evict_layouts_for<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    keep: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut resident = resident_layouts(root, owner);
+    if resident.contains(&keep) || resident.len() < MAX_RESIDENT_LAYOUTS {
+        return true;
+    }
+    // Nothing on the card says which layout the reader used last, and a record
+    // that did would be the drift R10 warns about. The lowest key that is not
+    // the one arriving is the deterministic choice.
+    resident.sort_unstable();
+    let mut complete = true;
+    while resident.len() >= MAX_RESIDENT_LAYOUTS {
+        let Some(victim) = resident.iter().copied().find(|layout| *layout != keep) else {
+            break;
+        };
+        if !empty_layout_cache(root, owner.key, victim) {
+            complete = false;
+            break;
+        }
+        resident.retain(|layout| *layout != victim);
+    }
+    complete
+}
+
+/// Rebuild a book index from the section files already on the card for one
+/// layout.
+///
+/// For the flip and the flip back. The sections are one file per layout and
+/// the index is one per book, so a reader who changes typography and changes
+/// back still has their old pagination and has lost only the index naming it.
+/// Rebuilding reads one header per section instead of re-parsing the EPUB.
+///
+/// Each section is checked against the layout and the source it claims, so a
+/// stale or foreign file stops the reindex. `None` leaves the caller to build
+/// from the EPUB.
+pub fn reindex_layout_from_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    sections: &mut [proto::cache::BookV2SectionRecord],
+) -> Option<(usize, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let layout = library.layout_key();
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    let mut count = 0usize;
+    let mut total_pages = 0u32;
+    while count < sections.len() {
+        let ordinal = count as u16;
+        let read = with_v2_section_file(root, owner, layout, ordinal, Mode::ReadOnly, |file| {
+            let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut bytes).is_err() {
+                return None;
+            }
+            let header = decode_section_v2_header(&bytes).ok()?;
+            if header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+                || header.page_count == 0
+            {
+                return None;
+            }
+            // Where the section opens in its item's content, which the
+            // index carries for it.
+            let skip = header.page_count as u32 * PAGE_RECORD_BYTES as u32;
+            if file.seek_from_current(skip as i32).is_err() {
+                return None;
+            }
+            let mut anchor = [0u8; PAGE_ANCHOR_BYTES];
+            if read_exact_file(file, &mut anchor).is_err() {
+                return None;
+            }
+            Some((header, u32::from_le_bytes(anchor)))
+        })
+        .flatten();
+        let Some((header, logical_offset)) = read else {
+            break;
+        };
+        sections[count] = proto::cache::BookV2SectionRecord {
+            section: ordinal,
+            spine: header.spine,
+            start_page: total_pages,
+            page_count: header.page_count,
+            partial: header.partial,
+            logical_offset,
+        };
+        total_pages = total_pages.saturating_add(u32::from(header.page_count));
+        count += 1;
+        // A partial section is the tail of a build that stopped. Nothing
+        // follows it, and claiming otherwise would fence the reader in behind
+        // a page count nothing will raise.
+        if header.partial {
+            break;
+        }
+    }
+    (count > 0 && total_pages > 0).then_some((count, total_pages))
+}
+
+pub fn empty_layout_cache<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
+        return true;
+    };
+    let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
+        return true;
+    };
+    let Ok(book) = cache.open_dir(key) else {
+        return true;
+    };
+    let index_gone = match book.delete_entry_in_dir(CACHE_BOOK_FILE) {
+        Ok(()) => true,
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    let sections_gone = match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => delete_layout_sections(&sections, layout),
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    index_gone && sections_gone
+}
+
+/// Delete every section file belonging to `layout`, in bounded batches, the
+/// way the orphan prune does: the directory walk does not promise anything
+/// about deleting while iterating.
+fn delete_layout_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    for _ in 0..max_passes {
+        let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
+            heapless::Vec::new();
+        if sections
+            .iterate_dir(|entry| {
+                if names.is_full() {
+                    return ControlFlow::Break(());
+                }
+                if entry.attributes.is_directory() {
+                    return ControlFlow::Continue(());
+                }
+                let mut name = String::<SHORT_NAME_BYTES>::new();
+                if write!(name, "{}", entry.name).is_err() {
+                    return ControlFlow::Continue(());
+                }
+                if proto::cache::section_file_is_layout(name.as_str(), layout) {
+                    let _ = names.push(name);
+                }
+                ControlFlow::Continue(())
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if names.is_empty() {
+            return true;
+        }
+        for name in &names {
+            if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
+                == upload_store::RemoveStatus::Failed
+            {
+                return false;
+            }
+        }
+    }
+    false
+}
+
 pub fn empty_cache_dir<
     D,
     T,
@@ -1914,14 +2208,22 @@ fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
     if !proto::cache::section_file_is_layout(name, layout) {
         return None;
     }
-    let digits = name
-        .get(3..6)
-        .filter(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))?;
-    let suffix = name.get(6..)?;
-    if !suffix.eq_ignore_ascii_case(".BIN") {
+    // Over bytes throughout, for the reason `section_file_is_layout` gives:
+    // one FAT byte past 0x7F turns into two here and moves every offset.
+    let bytes = name.as_bytes();
+    let digits = bytes.get(3..6)?;
+    if !digits.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<u16>().ok()
+    let suffix = bytes.get(6..)?;
+    if !suffix.eq_ignore_ascii_case(b".BIN") {
+        return None;
+    }
+    let mut ordinal = 0u16;
+    for digit in digits {
+        ordinal = ordinal.wrapping_mul(10) + u16::from(digit - b'0');
+    }
+    Some(ordinal)
 }
 
 /// Delete the section files a freshly published index no longer names.

@@ -90,6 +90,13 @@ pub(crate) struct BookBuildResume {
     /// Sections already written into the on-disk index. The walk's own frontier
     /// runs ahead of this between publishes; see `publish::INDEX_PUBLISH_SECTIONS`.
     published_sections: u16,
+    /// The layout this walk is paginating for.
+    ///
+    /// Part of what makes a resume ours, now that a book can hold a stored
+    /// pagination per layout. Without it, a walk suspended while building one
+    /// layout would be resumed by a step whose writers derive another, and the
+    /// second copy would be overwritten a section at a time by the first.
+    layout: u8,
 }
 
 impl BookBuildResume {
@@ -107,8 +114,10 @@ impl BookBuildResume {
     ///
     /// Every predicate that decides whether a resume is still ours goes through
     /// here, so the fast path and the outcome check cannot drift apart.
-    fn belongs_to(&self, index: usize, source_identity: (u32, u32)) -> bool {
-        self.index as usize == index && self.source_identity == source_identity
+    fn belongs_to(&self, index: usize, source_identity: (u32, u32), layout: u8) -> bool {
+        self.index as usize == index
+            && self.source_identity == source_identity
+            && self.layout == layout
     }
 }
 
@@ -371,7 +380,7 @@ pub(crate) fn build_or_load_book_cache(
     let live = matches!(status, BookLoadStatus::Ready)
         && scratch
             .resume
-            .is_some_and(|state| state.belongs_to(index, source_identity));
+            .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     if !live {
         scratch.resume = None;
         return BookBuildOutcome::Settled;
@@ -480,7 +489,11 @@ pub(crate) fn continue_book_build(
         esp_println::println!("epub: build continue lost catalog entry, dropping");
         return BackgroundStep::Abandoned;
     };
-    if !resume.belongs_to(resume.index as usize, (entry.source_hash, entry.byte_size)) {
+    if !resume.belongs_to(
+        resume.index as usize,
+        (entry.source_hash, entry.byte_size),
+        library.layout_key(),
+    ) {
         // A rescan moved a different book under this row. Building its spine
         // into the previous book's section table would corrupt both.
         esp_println::println!("epub: build continue entry changed, dropping");
@@ -620,7 +633,7 @@ where
     // for the rest — and "this walk, for this book", not merely for this row.
     let walk_is_live = scratch
         .resume
-        .is_some_and(|state| state.belongs_to(index, source_identity));
+        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
@@ -640,7 +653,31 @@ where
         // already been overwritten.
         scratch.resume = None;
     }
+    // The one moment a book gains a layout: the fast path missed, so this
+    // open will write one that was not there. Anything over the bound goes
+    // now, before the writers run.
+    if !fast_hit {
+        if let Some(owner) = owner.as_ref() {
+            if !files::evict_layouts_for(root, owner, library.layout_key()) {
+                esp_println::println!("epub: a stored layout would not delete; it stays counted");
+            }
+        }
+    }
+    // Before the replay: the same book at another layout, whose sections are
+    // still here.
+    let reindexed = !fast_hit
+        && owner.as_ref().is_some_and(|owner| {
+            try_reindex_layout(
+                root,
+                owner,
+                source_identity,
+                target_pages as u32,
+                library,
+                scratch,
+            )
+        });
     let replayed = !fast_hit
+        && !reindexed
         && owner.as_ref().is_some_and(|owner| {
             try_replay_content_cache(
                 root,
@@ -652,7 +689,7 @@ where
                 font_metrics,
             )
         });
-    let status = if fast_hit || replayed {
+    let status = if fast_hit || reindexed || replayed {
         BookLoadStatus::Ready
     } else {
         // The file borrows the directory the walk opened, so the build runs
@@ -2277,6 +2314,7 @@ where
             // Replaced below by whichever tail runs; a first open always
             // publishes, a continuation only past the batching threshold.
             published_sections: 0,
+            layout: library.layout_key(),
         };
         return if resume.is_none() {
             publish::publish_first_open(
@@ -2405,12 +2443,16 @@ where
             publish::BookPublishOutcome::IndexWriteFailed => {
                 // The index write failed partway, so BOOK.BIN may be a
                 // truncated file that serves neither the fast path nor
-                // replay (the labels load bails on it). Clear the debris —
-                // sections and CONT.BIN are useless without an index — so
-                // the next open rebuilds from the EPUB cleanly. Safe only
+                // replay (the labels load bails on it). Clear this layout's
+                // debris so the next open rebuilds it cleanly. Safe only
                 // because this arm is the *open* path: the book never became
                 // readable, so nothing is holding these files.
-                let _ = files::empty_cache_dir(root, owner.key);
+                //
+                // This layout's, not the book's. Another layout's pagination
+                // is finished work that this failure says nothing about, and
+                // CONT.BIN is settings-independent: taking it would turn the
+                // next open from a replay into a full re-parse.
+                let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -2473,6 +2515,77 @@ where
         self.inner
             .push_block(text, role, style, align, paragraph_end, logical_offset)
     }
+}
+
+/// Put a book back together from the section files one layout already has.
+///
+/// Runs between the fast path and the replay, on the route a typography flip
+/// takes: the sections for this layout are still on the card and only the
+/// index naming them is gone. A header read per section, against 25 s of
+/// replay or a cold build's minute.
+///
+/// Labels and TOC come from the index being replaced, which holds them for the
+/// book rather than for a layout. Without them the replay runs instead.
+#[inline(never)]
+fn try_reindex_layout<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+    requested_page: u32,
+    library: &mut ReaderStore,
+    scratch: &mut ReaderCacheScratch<'_>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let started = Instant::now();
+    if !files::load_v2_book_labels_and_toc(root, owner, source_identity, library) {
+        return false;
+    }
+    let Some((count, total_pages)) = files::reindex_layout_from_sections(
+        root,
+        owner,
+        source_identity,
+        library,
+        &mut scratch.book_sections[..],
+    ) else {
+        return false;
+    };
+    let sections = &scratch.book_sections[..count];
+    library.begin_book_load();
+    let published = publish::publish_book_cache(
+        root,
+        owner,
+        source_identity,
+        requested_page,
+        library,
+        sections,
+        total_pages,
+        false,
+        0,
+    );
+    if published.outcome != publish::BookPublishOutcome::Ready {
+        esp_println::println!("epub: reindex publish failed, falling back");
+        return false;
+    }
+    library.finish_book_load(
+        published.cover.map_or(0, |_| 0),
+        0,
+        reader_cache::store::BookLoadStatus::Ready,
+    );
+    esp_println::println!(
+        "epub: reindexed {} section(s) for this layout in {} ms",
+        count,
+        started.elapsed().as_millis()
+    );
+    true
 }
 
 /// Rebuild the section cache by replaying CONT.BIN — the captured
@@ -2615,11 +2728,13 @@ where
         );
     }
     if published.outcome != publish::BookPublishOutcome::Ready {
-        // Either failure leaves the replay's cache state unusable (a
+        // Either failure leaves this layout's cache state unusable (a
         // truncated BOOK.BIN or an unreadable section); the full build
-        // rewrites everything, so clear it all either way.
+        // rewrites it either way. Scoped to the layout: the full build that
+        // follows reads CONT.BIN, and another layout's pagination is not
+        // implicated in this one's failure.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_cache_dir(root, owner.key);
+        let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
         return false;
     }
     true
