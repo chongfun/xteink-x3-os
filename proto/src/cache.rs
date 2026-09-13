@@ -714,8 +714,9 @@ const CLAIM_MAGIC: [u8; 4] = *b"X4WH";
 const CLAIM_VERSION_NAMED: u8 = 1;
 /// Adds room for evidence about the file itself. A locator says where a book
 /// was, which is exactly what a move invalidates, so the record has space for
-/// the chain it occupies and the bytes it holds. Nothing on the card writes
-/// either today; the room is here for the identity work that will.
+/// the chain it occupies and the bytes it holds. The bytes are written once
+/// per copy, by the background reading a book's first open owes, and are
+/// what the scan matches a copy that moved by. Nothing writes the chain.
 const CLAIM_VERSION: u8 = 2;
 const CLAIM_ACTIVE: u8 = 1;
 const CLAIM_RELEASED: u8 = 2;
@@ -762,9 +763,12 @@ pub enum CacheClaimReading {
 /// a deletion frees, so a file written afterwards can be handed the same
 /// number and equality with it proves nothing about which copy this is.
 ///
-/// So both narrow and neither concludes, which is why nothing on the card
-/// acts on them. Either may also be absent: a claim written before this
-/// field existed has neither.
+/// So both narrow and neither concludes on its own. What acts on the digest
+/// is the scan's move search, and only against a file it has just read: the
+/// recorded bytes say which book to look for, and the reading says which
+/// file holds it. Either half may be absent: a claim written before this
+/// field existed has neither, and a book nobody has opened long enough has
+/// no digest yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheEvidence {
     /// The FAT first cluster of the file when the claim was written.

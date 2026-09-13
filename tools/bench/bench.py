@@ -1536,17 +1536,30 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 #   reclaimed  the load was abandoned on purpose: recovery removed an
 #            interrupted upload, so any catalog written before it may name a
 #            file that is now gone. The rescan that follows is the repair.
+#   unreconciled  recovery could not finish, so nothing established what the
+#            shelf holds. Where a miss, a stale snapshot and a reclaimed one
+#            are all answered by the scan that follows, this one is not: that
+#            scan refuses to rebuild for the same reason, so the reader has no
+#            library until a mount where recovery settles. A finding.
 #
-# `miss` is deliberately the narrowest of the five: the firmware used to
+# `miss` is deliberately the narrowest of them: the firmware used to
 # reduce the whole read to a bool inside the SD session, so a refused read, a
 # failed seek and a torn file all surfaced as that benign one.
-CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error", "reclaimed"}
+CATALOG_LOAD_RESULTS = {
+    "hit",
+    "miss",
+    "stale",
+    "invalid",
+    "error",
+    "reclaimed",
+    "unreconciled",
+}
 
 # The results that mean something went wrong. `miss`, `stale` and `reclaimed`
 # do not: a catalog not built yet, one the firmware has outgrown, and one
-# retired because recovery deleted a file it might name — all three answered
-# by the same scan.
-CATALOG_LOAD_FAULTS = {"invalid", "error"}
+# retired because recovery deleted a file it might name, each answered by the
+# same scan.
+CATALOG_LOAD_FAULTS = {"invalid", "error", "unreconciled"}
 
 # How the report names each one, so a miss does not read as a fault.
 CATALOG_LOAD_REASONS = {
@@ -1555,6 +1568,7 @@ CATALOG_LOAD_REASONS = {
     "invalid": "found an unusable snapshot",
     "error": "card error",
     "reclaimed": "retired after an interrupted upload was reclaimed (rebuilt by the scan)",
+    "unreconciled": "refused because storage recovery did not finish (the scan refuses too)",
     "not loaded": "did not load (older firmware: reason not recorded)",
 }
 

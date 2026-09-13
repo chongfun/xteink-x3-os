@@ -177,6 +177,21 @@ pub fn encode_record(digest: &SourceDigest) -> [u8; SOURCE_RECORD_BYTES] {
     out
 }
 
+/// Encode a digest that was already read off the card.
+///
+/// For a caller carrying evidence through memory of its own between two
+/// reads, which is what the scan's move search does with the digests of the
+/// copies that have gone missing. The boundary holds: what goes in is a
+/// record of what the bytes were, what comes back out of [`parse_record`]
+/// is the same, and nothing here hands anyone a [`SourceDigest`] to claim
+/// two files match with.
+pub fn encode_cached_record(digest: &CachedSourceDigest) -> [u8; SOURCE_RECORD_BYTES] {
+    encode_record(&SourceDigest::from_parts(
+        digest.byte_len(),
+        *digest.sha256(),
+    ))
+}
+
 /// Read a record back, or `None` for anything this build cannot trust.
 ///
 /// Short, foreign, from an unknown version, or failing its checksum all read

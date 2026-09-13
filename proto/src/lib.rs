@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod durable;
 pub mod epub;
 pub mod font_pack;
+pub mod identity;
 pub mod library_path;
 pub mod nvm;
 pub mod ota;

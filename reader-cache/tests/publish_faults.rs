@@ -2501,3 +2501,83 @@ fn a_carry_that_reports_success_really_carried() {
         );
     }
 }
+
+/// Two locators of one size whose cache keys agree, found by searching
+/// rather than made up: the key is 28 bits of a hash of the place, so a
+/// pair turns up among a few tens of thousands of names.
+fn colliding_locators(size: u32) -> (std::string::String, std::string::String) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<std::string::String, std::string::String> = HashMap::new();
+    for n in 0..400_000u32 {
+        let locator = std::format!("Book{n:06}.epub");
+        let key = moved_owner(&locator, size).0;
+        if let Some(first) = seen.insert(key, locator.clone()) {
+            return (first, locator);
+        }
+    }
+    panic!("no pair of locators shared a cache key");
+}
+
+/// A move whose two places share a cache directory is declined rather than
+/// carried.
+///
+/// Carrying it would mean re-attributing that one directory to the new
+/// locator, and the claim on it is where a book nobody uploaded records
+/// what its bytes were. This runs before the ledger has written the move
+/// down, on purpose, so that a reset retries it. Rewriting the claim first
+/// would leave a ledger naming the old place and a claim naming the new
+/// one, and the retry would find no evidence and mint the copy afresh. The
+/// reading place is lost instead, which the bridge already allows for.
+#[test]
+fn a_move_that_shares_a_cache_directory_leaves_the_evidence_alone() {
+    let size = 3_000u32;
+    let (was_locator, now_locator) = colliding_locators(size);
+    let (key, root_kind) = moved_owner(&was_locator, size);
+    assert_eq!(
+        key,
+        moved_owner(&now_locator, size).0,
+        "the search found a pair that share a directory"
+    );
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let was = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: root_kind,
+        locator: was_locator.as_str(),
+    };
+    let now = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: root_kind,
+        locator: now_locator.as_str(),
+    };
+
+    let digest = hashed(b"what this copy is");
+    files::record_cache_evidence(&root, &was, None, Some(digest)).expect("record");
+    files::write_position_file(&root, &was, 4, 40).expect("position");
+
+    assert_eq!(
+        files::carry_position_for_move(&root, &was, &now),
+        Ok(false),
+        "nothing is carried where one directory serves both places"
+    );
+
+    match files::read_book_dir_claimant(&root, was.key) {
+        files::DirClaimant::Claimed {
+            locator, evidence, ..
+        } => {
+            assert_eq!(
+                locator.as_str(),
+                was_locator.as_str(),
+                "the claim still names the copy the ledger names"
+            );
+            assert_eq!(
+                evidence.digest,
+                Some(CachedSourceDigest::new(digest)),
+                "and still says what its bytes were, for the scan that retries"
+            );
+        }
+        other => panic!("the claim is where it was: {other:?}"),
+    }
+}

@@ -3,6 +3,7 @@
 //! Lives here (not in firmware) so the encode/decode round-trip, the title
 //! field layout, and the orphan-sweep identity staging are host-testable.
 
+use crate::identity::{BookId, BOOK_ID_BYTES};
 use crate::library_path::BookRoot;
 use heapless::String;
 
@@ -43,16 +44,29 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// flat-only scan. Boot rescans only when a snapshot fails to load, so a
 /// flat v8 catalog would keep serving a library with every nested book
 /// missing until a manual refresh.
-pub const CATALOG_VERSION: u8 = 9;
+///
+/// v10 appends the book's [`BookId`] to every record, cached from the
+/// library ledger so the reading path never opens the ledger. The scan
+/// writes rows without one and `upload_store::ledger::assign_book_ids`
+/// fills them in before the header is committed, so a committed v10 catalog
+/// has an id on every row. The rescan a v9 snapshot forces is where the
+/// first ids are minted.
+pub const CATALOG_VERSION: u8 = 10;
 pub const CATALOG_HEADER_BYTES: usize = 8;
-pub const CATALOG_RECORD_BYTES: usize = 419;
+pub const CATALOG_RECORD_BYTES: usize = 435;
 // The record is encoded into a fixed buffer of that width, and the fields are
 // written at offsets derived from other modules' widths. These say so, rather
 // than letting a widened locator or alias run past the end of the buffer or
 // leave a silent gap in the middle of it.
 const _: () =
     assert!(CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES == CATALOG_RECORD_ALIAS_OFFSET);
-const _: () = assert!(CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES == CATALOG_RECORD_BYTES);
+const _: () =
+    assert!(CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES == CATALOG_RECORD_ID_OFFSET);
+const _: () = assert!(CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES == CATALOG_RECORD_BYTES);
+/// Byte range of the cached [`BookId`], exposed so the identity join can
+/// write just the id into a row the scan has already staged. All zero
+/// until then, which decodes as no id.
+pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 /// Byte range of the title field inside a record, exposed so the firmware
 /// can rewrite just the title in place when a book open learns the real
 /// EPUB title.
@@ -92,6 +106,13 @@ pub struct CatalogRecord {
     pub upload_alias: String<{ crate::storage::MAX_ALIAS_UTF8_BYTES }>,
     pub byte_size: u32,
     pub source_hash: u32,
+    /// Which library copy this row is, cached from the ledger.
+    ///
+    /// `None` only in a row the scan has staged and the identity join has
+    /// not reached, which a committed catalog does not contain: the join
+    /// decides every row it commits, giving it a copy's id or one of its
+    /// own.
+    pub book_id: Option<BookId>,
 }
 
 /// The library root is 0, so the common book costs a zero byte and a record
@@ -100,14 +121,14 @@ pub struct CatalogRecord {
 const ROOT_LIBRARY: u8 = 0;
 const ROOT_CARD: u8 = 1;
 
-const fn root_byte(root: BookRoot) -> u8 {
+pub(crate) const fn root_byte(root: BookRoot) -> u8 {
     match root {
         BookRoot::Library => ROOT_LIBRARY,
         BookRoot::CardRoot => ROOT_CARD,
     }
 }
 
-const fn book_root(byte: u8) -> Option<BookRoot> {
+pub(crate) const fn book_root(byte: u8) -> Option<BookRoot> {
     match byte {
         ROOT_LIBRARY => Some(BookRoot::Library),
         ROOT_CARD => Some(BookRoot::CardRoot),
@@ -259,6 +280,7 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         upload_alias,
         byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
         source_hash: u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+        book_id: catalog_record_book_id(record),
     }
 }
 
@@ -268,6 +290,31 @@ pub fn catalog_record_identity(record: &[u8; CATALOG_RECORD_BYTES]) -> (u32, u32
         u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
         u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
     )
+}
+
+/// The cached [`BookId`] of an encoded record, or `None` for a row the
+/// identity join has not reached.
+pub fn catalog_record_book_id(record: &[u8; CATALOG_RECORD_BYTES]) -> Option<BookId> {
+    let mut bytes = [0u8; BOOK_ID_BYTES];
+    bytes.copy_from_slice(
+        &record[CATALOG_RECORD_ID_OFFSET..CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES],
+    );
+    BookId::from_bytes(bytes)
+}
+
+/// The place of an encoded record, borrowed from its bytes: root, locator,
+/// and the size the scan saw. `None` for a root byte this build does not
+/// know, which is a row nothing may adopt or open.
+///
+/// For a caller comparing many rows against one place; decoding copies four
+/// strings it would not read.
+pub fn catalog_record_at(record: &[u8; CATALOG_RECORD_BYTES]) -> Option<(BookRoot, &str, u32)> {
+    let root = book_root(record[0])?;
+    let locator = fixed_str(
+        &record[CATALOG_RECORD_PATH_OFFSET..CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES],
+    );
+    let byte_size = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+    Some((root, locator, byte_size))
 }
 
 /// The `(source_hash, byte_size)` identity pre-v8 firmware would have given
@@ -669,6 +716,48 @@ fn fixed_str(bytes: &[u8]) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan stages a row with no id; the join writes one into the field
+    /// the offset names, and every reader of the row sees it. The place
+    /// comes back borrowed, exactly as encoded.
+    #[test]
+    fn a_row_carries_the_id_written_at_its_offset_and_none_before() {
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut record,
+            "spqr",
+            BookRoot::Library,
+            "History/Rome/SPQR.epub",
+            "SPQR",
+            "SPQR~1.EPU",
+            2_048,
+            0xDEAD_BEEF,
+        );
+        assert_eq!(catalog_record_book_id(&record), None);
+        assert_eq!(decode_catalog_record(&record).book_id, None);
+        assert_eq!(
+            catalog_record_at(&record),
+            Some((BookRoot::Library, "History/Rome/SPQR.epub", 2_048))
+        );
+
+        let id = BookId::from_bytes([0x5A; BOOK_ID_BYTES]).unwrap();
+        record[CATALOG_RECORD_ID_OFFSET..CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES]
+            .copy_from_slice(&id.to_bytes());
+        assert_eq!(catalog_record_book_id(&record), Some(id));
+        let decoded = decode_catalog_record(&record);
+        assert_eq!(decoded.book_id, Some(id));
+        // The id sits past every other field, so none of them moved.
+        assert_eq!(decoded.upload_alias.as_str(), "SPQR~1.EPU");
+        assert_eq!(decoded.path.as_str(), "History/Rome/SPQR.epub");
+        assert_eq!(catalog_record_identity(&record), (0xDEAD_BEEF, 2_048));
+
+        record[0] = 0x7F;
+        assert_eq!(
+            catalog_record_at(&record),
+            None,
+            "an unknown root is no place"
+        );
+    }
 
     /// The two collision fixtures, as catalog records. Same size, same
     /// 32-bit identity, different places on the card.

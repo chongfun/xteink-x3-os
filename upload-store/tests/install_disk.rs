@@ -8,6 +8,7 @@
 use core::ops::ControlFlow;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, LfnBuffer, Mode, TimeSource, Timestamp,
@@ -515,7 +516,7 @@ fn an_upload_with_no_bytes_is_refused_before_a_record_exists() {
         let staged = StagedUpload::begin(&root, &books, name, None).expect("stage");
         assert!(
             matches!(
-                staged.install(&root, &books),
+                staged.install(&root, &books, &mut words()),
                 Err(install::InstallError::Empty)
             ),
             "an upload of {name} with no body must be refused, not journalled"
@@ -564,7 +565,7 @@ fn a_replacement_for_an_empty_book_is_refused_rather_than_guessed() {
     staged.write(&new_body()).expect("stream");
     assert!(
         matches!(
-            staged.install(&root, &books),
+            staged.install(&root, &books, &mut words()),
             Err(install::InstallError::Empty)
         ),
         "a predecessor with no chain must not be journalled"
@@ -992,7 +993,7 @@ fn upload(root: &Dir<'_>, books: &Dir<'_>, name: &str, body: &[u8]) -> Option<St
 fn landing(root: &Dir<'_>, books: &Dir<'_>, name: &str, body: &[u8]) -> Option<Landed> {
     let mut staged = StagedUpload::begin(root, books, name, None).expect("stage");
     staged.write(body).expect("stream");
-    staged.install(root, books).expect("install")
+    staged.install(root, books, &mut words()).expect("install")
 }
 
 #[test]
@@ -1288,7 +1289,7 @@ fn re_uploading_a_book_from_before_long_names_replaces_it() {
     let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
     staged.write(&new_body()).expect("stream");
     let alias = staged
-        .install(&root, &books)
+        .install(&root, &books, &mut words())
         .expect("install")
         .expect("the book landed")
         .alias;
@@ -1344,7 +1345,7 @@ fn a_legacy_book_with_another_identity_is_left_alone() {
     let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
     staged.write(&new_body()).expect("stream");
     let alias = staged
-        .install(&root, &books)
+        .install(&root, &books, &mut words())
         .expect("install")
         .expect("the book landed")
         .alias;
@@ -1924,7 +1925,9 @@ fn staging_over_a_leftover_never_frees_a_chain_the_shelf_is_reading() {
 
     // And the upload that follows still works, replacing it properly.
     staged.write(&old_body()).expect("stream");
-    staged.install(&root, &books).expect("install");
+    staged
+        .install(&root, &books, &mut words())
+        .expect("install");
     assert_eq!(body_named(&books, BOOK_NAME), old_body());
     assert_eq!(shelf_long_names(&books).len(), 1);
 }
@@ -2230,7 +2233,7 @@ fn the_identity_does_not_depend_on_how_the_body_was_chunked() {
         staged.write(chunk).expect("stream");
     }
     let landed = staged
-        .install(&root, &books)
+        .install(&root, &books, &mut words())
         .expect("install")
         .expect("landed");
 
@@ -2842,4 +2845,19 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
         "no cut caught both journals live at once, so the handoff itself was never \
          exercised -- only its end state",
     );
+}
+
+/// A word source for minting ids in these tests: distinct, and not random,
+/// since nothing here asserts on the ids themselves.
+///
+/// Distinct across call sites, which is the part that took a fix. Every
+/// generator started from one seed, so two uploads in a test minted the same
+/// id and the ledger held a duplicate no production path can produce.
+fn words() -> impl FnMut() -> u32 {
+    static SEED: AtomicU32 = AtomicU32::new(0x2545_F491);
+    let mut state = SEED.fetch_add(0x9E37_79B9, Ordering::Relaxed);
+    move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    }
 }

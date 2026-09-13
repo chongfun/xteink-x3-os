@@ -699,10 +699,10 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
-Behind that list, `/READER/CATALOG.BIN` (v9: `X4CT` magic, u16 book count,
-419-byte records) is the whole book set, and stays the source of identity, the
-orphan sweep's ledger, the wifi shelf listing, and what a chosen locator
-resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
+435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
+book set, and stays what the orphan sweep judges against, the wifi shelf
+listing, and what a chosen locator resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
 card. That count field is also the library's
 ceiling: 65,535 books. A card holding more fails the scan rather than
@@ -768,6 +768,238 @@ against that arrival: the candidate search, the verdict rule that refuses
 every inference available today, `carry_position`, and the version 2 claim
 that has somewhere to put evidence. None of them runs on the card.
 
+That record now exists, though nothing hangs from it yet. The library ledger,
+`/READER/LEDGERA.BIN` and `LEDGERB.BIN`, adopts every physical EPUB the scan
+catalogues under a `BookId`: sixteen random bytes from the hardware RNG,
+minted once, derived from nothing on the card, and bound by the ledger to the
+root, locator and size the copy had when it was adopted (`proto::identity`,
+`upload_store::ledger`). Every catalog row caches its id, so the reading path
+does not open the ledger. A catalog rebuild joins its fresh rows to the
+ledger by place: a row a live record names by root, locator and size keeps
+that record's id, every other row is minted one, and the new records are
+committed as a ledger generation before the catalog header lands, so no
+committed row carries an id the ledger could lose. Two byte-identical files
+are two ids with independent state. A copy moved on a computer is matched
+back to its record by the search described below, and the record of a copy
+that has simply gone stays as a missing book meanwhile. Each record counts
+the consecutive scans its place has been missing; a missing record is carried
+for eight such scans and then left out, and missing records are the first to
+go when a generation would not fit beside the live library, so the ledger
+stays near the size of the library rather than of every book that ever
+passed through it. A card emptied of books is a scan with no rows, and it
+ages every record the same way. A scan that changes nothing writes nothing.
+
+The ledger is durable state where the catalog is a cache, so it is written
+the way positions are: whole, to the side that is not live. Records go down
+under an all-zero placeholder header and the file is closed at its final
+length; then the real header is written over the placeholder in a second
+open, so a generation with a header is a generation with all of its records.
+Which side is live is kept in a third file, `/READER/LEDGER.JNL`. While a
+rewrite lays the target's records down it still names the side that stands,
+so whatever the target held before is not consulted; once the records are
+down it says which side is being written and what stood on the other; and
+after the new header has landed and read back it says which side is live and
+what its header is. The journal is two sector-sized slots written
+alternately with a sequence number, as `RECLAIM.JNL` is, so a write torn by
+a power cut damages the slot being written and the entry before it still
+reads; falling back one entry is safe because a generation's ids reach a
+committed catalog only after the journal has named it live. A torn write of
+a target's header reads the same way: under a journal that says the side is
+being written, a target that is not the committed, whole generation expected
+is a commit that did not land. A reader believes only what the journal
+accounts for. The side it names as
+live must hold the header it recorded; during a rewrite, the target is live
+if its header landed with the generation after the one that stood, and
+otherwise the side that stood is, if it still holds exactly what was
+recorded. The generation chosen is then checked for length and every record.
+Anything else refuses: a live side that is empty, missing, or under another
+header, a header or journal this build did not write, a header or journal
+of a version it does not read, or ledger files with no journal beside them.
+Those states are the loss of durable identity rather than an interrupted
+write, and the side that is not live is missing every id the live one added,
+so taking it would re-mint those and orphan whatever comes to hang from
+them. The scan asks the ledger before it touches the catalog, so a refusal
+leaves the committed catalog serving the shelf as it was and stops only
+rebuilds, until the intact records are salvaged by something explicit. The
+join stages six-byte `(hash, row)` keys in the scan arena behind one bit per
+ledger record and reads the ledger once per 2,730 rows, so a rebuild costs
+one sequential pass over the ledger plus one row read and one 16-byte write
+per matched row, rather than a file open per book.
+
+A place has one file, so the copy at it has one id: publishing a record for
+a place, or moving one to it, drops any other record naming it, since the
+caller has just proved which copy is there. Without that, a book deleted on
+a computer and uploaded again left the deleted copy's record naming the name
+the upload had just taken, and both records stayed live for ever, with the
+scan choosing between them by ledger order rather than by evidence. A ledger
+that arrives with a place named twice anyway, which this writer does not
+produce, gives the row to the first record in ledger order and stops
+treating the other as naming anything, so it ages out on the ordinary
+retention schedule and the ledger comes back to one id per copy on its own.
+While it lasts, that record has no place to give, and neither has the
+record of a book a computer replaced with one of another size, which is the
+ordinary way to reach the same shape: the row stops matching the old record
+and is minted an id of its own, so the old record is carried as missing at a
+name the new copy holds. Asking where the displaced id is answers with
+nothing rather than with the other copy's file, while the id that holds the
+place answers with it. A place belongs to the record the last scan matched
+to it, which is the record with no misses, and a place another id holds is
+not an empty place a copy can come back to. Resolving one copy's state
+against another copy's book is the merge that costs more than the copy.
+Both records stay in the ledger, to be matched by their bytes or aged out
+with everything else the card stopped holding. Two records that are both
+missing keep their places, neither being the one a scan chose.
+
+A copy moved or renamed on a computer is found again rather than adopted as
+a stranger, when the card says enough to prove it. The scan already knows
+which records named no row and which rows no record named, so the search
+runs between those two sets alone: a shelf that did not change reads no
+book, and a stable file is not read again to prove what the join matched by
+place. Size narrows the candidates and the recorded digest decides, since a
+name and a length are not a book.
+
+Most of a library has no digest in the ledger, since a scan adopts a book
+without reading it and reading a whole card to adopt it would cost hours for
+a move that may never happen. So the open book's bytes are read instead, once
+per copy, and recorded in the claim on the cache directory it keeps its
+reading place in. The read rides the same background slices the spine walk
+uses rather than standing between the reader and their first page: a book is
+megabytes and this card gives up around 550 kB a second, so a large one is
+the better part of a minute. It follows the book that is open, by root,
+locator and length rather than by row number or cache key: a rescan
+renumbers rows, and a cache key is 28 bits of a hash that two books can
+share, either of which would leave a book unread on another book's account.
+A reader who moves on takes the reading with them, and the copy they left is
+read again whenever it is opened again. Nothing depends on it finishing, and
+a partial read records nothing.
+
+That directory is named for the place the record still names, so the search
+asks it for any copy the ledger says nothing about: a book that has been
+read can be found again, and one that has not cannot, which is the same rule
+the reading place it would carry lives by. A claim naming another book is no
+evidence about this one, since a cache key is 28 bits of a hash and two
+books can land on one and the same directory.
+
+What a claim says is copied into the copy's own record on the scan that
+first misses it, whether or not anything turned up to compare it with. The
+cache is a cache: a departed book's directory is what the sweep tidies away,
+and the ledger is where identity lives, so once the library has learned what
+a copy is, an ordinary tidy-up cannot make it forget. Without that, two
+identical copies could lose one of their two claims and leave the other
+looking like the only book those bytes could belong to.
+
+So what a copy *is*, for a book the library adopted without reading, is the
+bytes seen at its own place while that place looked unchanged. A computer
+can put a different book of exactly the same length at that name, which the
+join's cheap filter cannot see and no later reading can undo, since nothing
+on the card ever said what the first book's bytes were. The copy then takes
+the bytes that were read there, and a move carries its id and its reading
+place to wherever those bytes go. That is a deliberate rule rather than an
+oversight: the alternative is reading every book as the scan adopts it,
+which is hours on a full card for a move that may never happen, and the
+cost is bounded by what the caches already do, since a same-sized
+replacement at a stable name reopens the old book's cache and resumes its
+place today. The rule makes that durable across a later rename rather than
+inventing it. A copy that arrived as an upload is not in this position: its
+bytes were read as it landed.
+
+A copy nothing recorded the bytes of is left missing while the file that
+appeared is adopted in its own right. Ambiguity is left alone from either
+side: two missing copies of the same bytes, or one missing copy and two
+files holding them, are copies no file can be told apart by, so their places
+stay as they are. A scan decides a length or leaves it alone. Every
+unclaimed file whose length a missing copy has is read, so one match
+means one match. There is no reading budget to run out of and
+nothing carried to another scan. Bounding that reading instead would mean
+deciding on part of the evidence, or keeping a half-finished question
+somewhere, and a question that outlives a scan wants a journal of its own
+rather than a state spread through the catalog, the ledger and the cache.
+What a card costs a scan is therefore the reading of every file whose length
+changed hands, which is the size of the reorganisation rather than the size
+of the library: measured on the X3, a whole-file read and hash runs at about
+580 kB a second, so a book of eight megabytes costs fifteen seconds to prove
+and a card nobody reorganised costs nothing at all. A file the card would not give up costs its whole length:
+what the files of that length hold is not known well enough to say which
+copy any of them is, so those copies are left alone and the files adopted
+in their own right.
+
+One scan repairs as many copies as the scan arena holds, which bounds the
+memory rather than the evidence: every missing copy's digest is compared
+against the ones being carried, so a twin past the end of the table still
+refuses the repair.
+
+A repaired locator on its own would leave the reader's place behind, since
+a position is filed under the place a book was read from. So the scan
+reports each copy it finds again, before it writes the ledger, and the
+firmware carries the position from the old directory to the new one,
+reading the destination once more to say what it is vouching for. Reporting
+before the write costs a reset nothing: the record is still missing and the
+row still unadopted, so the next scan finds the same move and carries the
+same place again. A card that refuses the carry itself is the one case this
+bridge does not cover: the copy keeps its id and loses its place, rather
+than the scan failing over a cache write. The bridge goes when positions
+hang from the id, at which point a repaired locator keeps the place with
+nothing to copy.
+
+Positions and caches still key by place, and the mapping they will move onto
+is what exists now: a place resolves to the id that owns it
+(`upload_store::ledger::find_record`), an id resolves to wherever that copy
+has got to (`find_by_id`), and the open book carries its id in RAM beside
+its locator (`ReaderStore::active_copy_id`), so a rename moves the answer
+without changing the question and a copy the last scan missed still answers,
+saying how many scans have missed it. Two byte-identical copies are two ids
+whose records, sizes and digests move independently, and whose positions are
+filed apart because a cache directory is named for a place. The format
+change that files a position under its id belongs to the reading-position
+work, which moves the page index onto a content anchor in the same
+migration: one migration of the position file rather than two.
+
+A managed replacement, an upload landing under a name the shelf already
+holds, is the one case where a copy's bytes change under its id, and it
+spans two transactions: `INSTALL.JNL` swaps the bytes, and the ledger has to
+be told. `/READER/REPLACE.JNL` bridges them. Before the installer writes
+`INSTALL.JNL` it publishes an intent there naming the copy's id, the place
+the install lands spelled as typed, what stood there (nothing, a predecessor
+whose bytes were not read, or one whose digest was read in this session) and
+the exact spelling it stood under, and the digest of the bytes staged to
+land; the intent stands after `INSTALL.JNL` clears and is cleared only once
+the ledger record has been rewritten under the same id with the new size and
+digest. What the ledger recorded of the predecessor's bytes is not promoted
+into the intent: a computer may have replaced the file with another of the
+same size between transactions, which the ledger cannot see, so the
+installer says "unknown" and only a caller that hashed the predecessor says
+"known". Recovery resolves the intent after the filesystem journals have
+settled, and asks the card rather than the record which side won, by hashing
+the destination: the new digest is decisive; a known predecessor is
+recognised by its digest; an unknown one as any file that is not the new
+bytes, which the sole-writer contract makes sufficient; and where nothing
+stood, nothing standing is the old landing. Anything else keeps the intent
+and refuses, and while it stands no scan adopts and no other change to the
+shelf begins. In the session that ran the install the landing is known from
+the install's own proof that the destination is on its chain, so nothing is
+hashed twice. Names match by FAT's rules on the card and exactly in the
+ledger, so an upload spelled another way replaces the copy the installer
+found and respells its place, and a rollback puts the predecessor back under
+the spelling typed; settling moves the record to whichever spelling the file
+ends up under. A book with no long name is found by its rendered alias, the
+name a listing shows it under and the locator the library adopts it by, so
+it is replaced under that name and keeps its id like any other. Anything
+else answering to the name where the upload would land refuses it before
+anything is journalled or moved: two entries answering alike, whichever of
+them the upload spells, or a folder carrying the name, which unpacking an
+EPUB on a computer leaves behind. FAT gives a directory one namespace over
+long names and aliases together, with case ignored, so the landing would be
+refused by whichever the install had not taken, and the rollback after it,
+halfway through. A ledger with no room for a fresh copy's record lets a
+missing copy go to make it, chosen when the intent is published from the
+records the last scan found missing and verified absent then, which the
+sole-writer contract keeps true while it stands; with none to let go of, the
+install refuses before anything is journalled. The file is two slots like
+the ledger journal, so a torn publication is an install that has not begun
+and a torn clear is an intent resolved again. No id or digest enters
+`INSTALL.JNL` or `RECLAIM.JNL`: the filesystem transaction decides what the
+card holds, and this one records what that means for identity.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN
@@ -778,7 +1010,11 @@ that has somewhere to put evidence. None of them runs on the card.
 /READER/CATALOG.BIN
 /READER/INSTALL.JNL
 /READER/LABELS/<stem>.TXT
+/READER/LEDGER.JNL
+/READER/LEDGERA.BIN
+/READER/LEDGERB.BIN
 /READER/PROBE.TXT
+/READER/REPLACE.JNL
 /READER/ROLLBACK/<txn>
 /READER/UPLOAD/<txn>
 /READER/STATEA.BIN

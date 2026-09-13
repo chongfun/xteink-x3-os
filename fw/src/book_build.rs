@@ -709,6 +709,205 @@ where
 /// Only the active book has a resident locator, and every open stages its row
 /// as active first, so `None` means that staging did not happen or the record
 /// held nothing openable.
+/// A copy whose bytes the card has not recorded, read a slice at a time.
+///
+/// A scan adopts a book without reading it, so for everything a computer
+/// put on the card the claim beside its reading place is the only thing
+/// that will say what its bytes were, and the only thing that lets a later
+/// scan find the book again after a move. The whole stream has to be read
+/// for the claim to say anything, and a book is megabytes: on this card
+/// around 550 kB a second, so a large one is the better part of a minute.
+/// That cannot stand between the reader and their first page, so it rides
+/// the same background slices the spine walk uses.
+///
+/// Nothing depends on it finishing. A book closed halfway through is a book
+/// whose bytes are recorded on some later open, and one that is never
+/// opened long enough is one a move cannot find again, which is the state
+/// every book was in before.
+pub(crate) struct SourceEvidenceJob {
+    place: EvidencePlace,
+    offset: u32,
+    started: Instant,
+    hasher: proto::source::SourceHasher,
+}
+
+/// Which copy a reading is about: the place itself, exactly.
+///
+/// Not the cache directory it is filed under, whose name is 28 bits of a
+/// hash of this and which two books can share. Deciding by that name would
+/// leave a book unread because another one's reading had settled under it,
+/// and would let a reader moving between two such books keep the reading
+/// they moved away from. Not a row number either, which a rescan
+/// renumbers, and not a `BookId`, which a copy the scan has left in
+/// question does not have yet.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct EvidencePlace {
+    at: BookRoot,
+    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+    len: u32,
+}
+
+impl EvidencePlace {
+    /// The cache directory this place's claim lives in.
+    fn key(&self) -> String<{ proto::cache::CACHE_KEY_BYTES }> {
+        proto::cache::cache_key_from(proto::cache::source_hash_at(
+            self.at,
+            self.locator.as_str(),
+            self.len,
+        ))
+    }
+}
+
+/// What one slice of that reading did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvidenceStep {
+    /// More of the book to read; call again.
+    Continued,
+    /// The stream was read whole and the claim now says what it held, or
+    /// the claim already said and nothing needed reading.
+    Finished,
+    /// The card would not give the book up, or gave up less of it than it
+    /// said it held. Nothing is recorded from a partial read, so the job is
+    /// dropped whole. The caller decides when to ask again: the display task
+    /// leaves this copy alone until the reader has opened another book, or
+    /// until the next session, rather than reading at a card that just
+    /// refused on every page turn.
+    Abandoned,
+}
+
+/// How much of a book one slice reads. Sized against the background build's
+/// own slice, since it is the same reader waiting either way.
+const EVIDENCE_SLICE_BYTES: u32 = 192 * 1024;
+
+impl SourceEvidenceJob {
+    /// The copy this is reading.
+    pub(crate) fn place(&self) -> &EvidencePlace {
+        &self.place
+    }
+}
+
+/// The place the open book occupies, which is where both its reading place
+/// and what it recorded of its bytes are filed.
+///
+/// A place rather than a row number, since a rescan renumbers rows and this
+/// has to outlive one, and rather than a [`proto::identity::BookId`], since
+/// a book whose adoption a scan is still deciding has no id yet and its
+/// bytes are worth reading all the same.
+pub(crate) fn evidence_place(library: &ReaderStore) -> Option<EvidencePlace> {
+    let index = library.active_index()?;
+    let len = library.catalog_entry(index)?.byte_size;
+    if len == 0 {
+        return None;
+    }
+    let (at, locator) = library.book_location(index)?;
+    let mut owned = String::new();
+    owned.push_str(locator).ok()?;
+    Some(EvidencePlace {
+        at,
+        locator: owned,
+        len,
+    })
+}
+
+/// The job for the open book, when the store knows where it is.
+///
+/// No card access: whether the claim already records the bytes is the first
+/// slice's business, so arming costs an open nothing.
+pub(crate) fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
+    Some(SourceEvidenceJob {
+        place: evidence_place(library)?,
+        offset: 0,
+        started: Instant::now(),
+        hasher: proto::source::SourceHasher::new(),
+    })
+}
+
+/// Read the next slice of a book whose bytes are not recorded yet, and
+/// record them once the last slice is in.
+#[inline(never)]
+pub(crate) fn continue_source_evidence(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    job: &mut SourceEvidenceJob,
+) -> EvidenceStep {
+    let Ok(path) = LibraryPath::parse(job.place.locator.as_str()) else {
+        return EvidenceStep::Abandoned;
+    };
+    let key = job.place.key();
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: job.place.at,
+        locator: job.place.locator.as_str(),
+    };
+    let slice = sd_session::with_root(epd, sd_cs, |root| {
+        // Asked once, on the first slice: a book whose bytes are already
+        // recorded is most of a library most of the time.
+        if job.offset == 0
+            && files::recorded_evidence(root, &owner).is_some_and(|held| held.digest.is_some())
+        {
+            return EvidenceStep::Finished;
+        }
+        let read = upload_store::library::with_book_at(root, job.place.at, &path, |dir, alias| {
+            let Ok(file) = dir.open_file_in_dir(alias, Mode::ReadOnly) else {
+                return None;
+            };
+            if file.length() != job.place.len || file.seek_from_start(job.offset).is_err() {
+                // A file that is not the length the row said is not the
+                // copy this job was armed for.
+                return None;
+            }
+            let mut buffer = [0u8; 512];
+            let mut taken = 0u32;
+            while taken < EVIDENCE_SLICE_BYTES && job.offset + taken < job.place.len {
+                let want = (job.place.len - job.offset - taken).min(buffer.len() as u32) as usize;
+                match file.read(&mut buffer[..want]) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        job.hasher.update(&buffer[..read]);
+                        taken += read as u32;
+                    }
+                    Err(_) => return None,
+                }
+            }
+            Some(taken)
+        });
+        let Ok(Some(Some(taken))) = read else {
+            return EvidenceStep::Abandoned;
+        };
+        job.offset += taken;
+        if job.offset < job.place.len {
+            return if taken == 0 {
+                // The card stopped giving the book up before its end, so
+                // what has been read is not the stream and cannot be
+                // recorded as it.
+                EvidenceStep::Abandoned
+            } else {
+                EvidenceStep::Continued
+            };
+        }
+        let digest =
+            core::mem::replace(&mut job.hasher, proto::source::SourceHasher::new()).finish();
+        match files::record_cache_evidence(root, &owner, None, Some(digest)) {
+            Ok(()) => {
+                bench_log!(
+                    "bench: storage_evidence action=record len={} elapsed_ms={} t_ms={}",
+                    job.place.len,
+                    job.started.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
+                EvidenceStep::Finished
+            }
+            // A claim that would not take it costs a later scan the chance
+            // to find this copy again, and costs this reader nothing.
+            Err(_) => {
+                esp_println::println!("storage: could not record what this copy is");
+                EvidenceStep::Abandoned
+            }
+        }
+    });
+    slice.unwrap_or(EvidenceStep::Abandoned)
+}
+
 fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
     let (at, path) = library.book_location(index)?;
     Some((at, LibraryPath::parse(path).ok()?))

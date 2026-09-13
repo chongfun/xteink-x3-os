@@ -283,8 +283,8 @@ where
 /// that read the bytes but not the directory entry has a digest and no
 /// chain, and an older claim has neither and may still learn one.
 ///
-/// No firmware path calls this; claims on the card carry no evidence. Kept
-/// for the identity-authorised reconciliation that would populate it.
+/// Called once per copy by the background reading of a book's bytes, which
+/// is where a book nobody uploaded gets a digest at all.
 pub fn record_cache_evidence<
     D,
     T,
@@ -344,8 +344,8 @@ where
 ///
 /// `Ok(false)` is a departed directory with no position to carry.
 ///
-/// Unreachable from the firmware, which may not conclude that a book moved.
-/// Kept and tested for the identity work that will be able to.
+/// Reached from the firmware through [`carry_position_for_move`], on a move
+/// the scan has proved. Nothing else may conclude that a book moved.
 pub fn carry_position<
     D,
     T,
@@ -384,6 +384,12 @@ where
         // stranger. The digest is what says otherwise, and having one means
         // somebody read these bytes and found the departed owner's witness
         // in them.
+        //
+        // It rewrites the one thing a departed copy's evidence lives in, so
+        // a caller whose durable record of the move has not landed yet must
+        // not reach here: what it would take away is what the retry reads.
+        // See [`carry_position_for_move`], which declines this case for
+        // exactly that reason.
         let mut book = root
             .open_dir(CACHE_ROOT_DIR)
             .map_err(|_| ClaimDenied::Fault)?;
@@ -403,6 +409,96 @@ where
     )
     .map_err(|_| ClaimDenied::Fault)?;
     Ok(true)
+}
+
+/// What a book's own claim records of its bytes, when it records anything.
+///
+/// For a caller deciding whether reading the book again would tell the card
+/// something it does not already know. `None` covers every reason not to
+/// bother distinguishing: no directory, no claim, another book's claim, or
+/// one written before claims carried evidence.
+pub fn recorded_evidence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Option<proto::cache::CacheEvidence>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
+    let book = cache.open_dir(owner.key).ok()?;
+    match book_dir_claim(&book, owner) {
+        ClaimState::MineActive | ClaimState::MineReleased => match read_stored_claim(&book) {
+            StoredClaim::Present { evidence, .. } => Some(evidence),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Carry a reading position to where a copy has been found again.
+///
+/// The place a reader left is filed under where the copy used to be, so a
+/// repaired locator on its own would leave it behind. The scan proves the
+/// move by the bytes; this reads the destination again rather than taking
+/// that word for it, because what it writes into the claim is a statement
+/// about the bytes at the new place and the only way to make one is to read
+/// them.
+///
+/// `Ok(false)` is a copy that had no place to carry, which is most of a
+/// library, or one whose two places share a cache directory. That last is
+/// declined rather than carried: with one directory between them the carry
+/// would have to re-attribute it, which rewrites the claim the copy's
+/// bytes are recorded in, and this runs before the ledger has written the
+/// move down. A reset in that window would leave a ledger naming the old
+/// place and a claim naming the new one, so the retry the ordering exists
+/// for would find no evidence and mint the copy afresh. The reader's place
+/// is lost in that case, which the bridge already allows for, and the
+/// copy's identity is not, which it does not. Two locators share a key
+/// once in a few hundred million.
+pub fn carry_position_for_move<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    was: &proto::cache::CacheOwner<'_>,
+    now: &proto::cache::CacheOwner<'_>,
+) -> Result<bool, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if was.key == now.key {
+        return Ok(false);
+    }
+    let path =
+        proto::library_path::LibraryPath::parse(now.locator).map_err(|_| ClaimDenied::Fault)?;
+    let read = upload_store::library::with_book_at(root, now.root, &path, |dir, alias| {
+        let mut name = heapless::String::<12>::new();
+        use core::fmt::Write as _;
+        if write!(name, "{}", alias).is_err() {
+            return None;
+        }
+        upload_store::digest_of_file(dir, name.as_str())
+            .ok()
+            .flatten()
+    })
+    .map_err(|_| ClaimDenied::Fault)?
+    .flatten();
+    let Some(digest) = read else {
+        return Err(ClaimDenied::Fault);
+    };
+    carry_position(root, was, now, digest, None)
 }
 
 /// The position files inside an open book directory.
@@ -2723,9 +2819,10 @@ pub enum DirClaimant {
         root: proto::library_path::BookRoot,
         locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
         released: bool,
-        /// What the claim records about the physical file. Read back for the
-        /// identity-authorised reconciliation this is kept for; nothing on
-        /// the card writes it today, so it is empty in practice.
+        /// What the claim records about the physical file: the bytes a
+        /// book's first open reads, which the scan's move search matches a
+        /// departed copy by. Empty for a book nobody has opened long
+        /// enough, and for a claim written before the field existed.
         evidence: proto::cache::CacheEvidence,
     },
     /// No claim, or bytes that are not one: the pre-claim compatibility

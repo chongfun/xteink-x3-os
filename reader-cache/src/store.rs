@@ -266,6 +266,16 @@ pub struct ReaderStore {
     /// nothing. `None` is a record this build could not place.
     active_root: Option<proto::library_path::BookRoot>,
     active_path: String<{ proto::library_path::MAX_PATH_BYTES }>,
+    /// Which copy the active book is, as the library ledger knows it: the
+    /// id per-copy state is addressed by, cached in the catalog row the open
+    /// staged. Distinct from the `book_id` the app's views pass around,
+    /// which numbers a place in the reading list.
+    ///
+    /// Lives exactly as long as the locator beside it, a rescan included: a
+    /// locator says where the copy is and this says which copy it is, and
+    /// rebuilding the catalog changes neither. `None` is a row written
+    /// before the ledger adopted it.
+    active_copy_id: Option<proto::identity::BookId>,
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub loaded_index: Option<usize>,
@@ -390,6 +400,7 @@ impl ReaderStore {
             active_entry: LibraryBookEntry::new(),
             active_root: None,
             active_path: String::new(),
+            active_copy_id: None,
             active_index: None,
             current_index: None,
             loaded_index: None,
@@ -766,6 +777,7 @@ impl ReaderStore {
         byte_size: u32,
         source_hash: u32,
         label_override: Option<&str>,
+        copy_id: Option<proto::identity::BookId>,
     ) {
         fill_entry(
             &mut self.active_entry,
@@ -777,7 +789,15 @@ impl ReaderStore {
         self.active_root = root;
         self.active_path.clear();
         let _ = self.active_path.push_str(path);
+        self.active_copy_id = copy_id;
         self.active_index = Some(index);
+    }
+
+    /// Which copy the active book is, for the state that hangs from a copy
+    /// rather than from a place. `None` is a book whose row carries no id,
+    /// which is a card the ledger has not been over.
+    pub fn active_copy_id(&self) -> Option<proto::identity::BookId> {
+        self.active_copy_id
     }
 
     /// Where row `index` is on the card, for a path that is about to open it:
@@ -1785,6 +1805,53 @@ mod tests {
     extern crate std;
     use super::*;
     use std::boxed::Box;
+
+    /// The open book's copy id is what per-copy state is addressed by, so it
+    /// has to be resident for as long as the place beside it: a rescan
+    /// rebuilds the catalog, which says where copies are, and changes
+    /// nothing about which copy is which.
+    #[test]
+    fn the_active_book_carries_the_copy_id_its_row_was_adopted_under() {
+        let mut store = Box::new(ReaderStore::new());
+        assert_eq!(store.active_copy_id(), None, "nothing is open yet");
+        let id = proto::identity::BookId::from_bytes([3u8; 16]).expect("an id");
+        store.set_active_entry(
+            4,
+            "/books/Dune.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Dune.epub",
+            3_000,
+            0x1234_5678,
+            None,
+            Some(id),
+        );
+        assert_eq!(store.active_copy_id(), Some(id));
+        assert_eq!(
+            store.book_location(4),
+            Some((proto::library_path::BookRoot::Library, "Dune.epub"))
+        );
+
+        store.clear_catalog();
+        assert_eq!(
+            store.active_copy_id(),
+            Some(id),
+            "a rescan does not change which copy the reader has open"
+        );
+
+        // A card whose ledger has not been over this row yet says so, rather
+        // than leaving the last book's id standing.
+        store.set_active_entry(
+            5,
+            "/books/Emma.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Emma.epub",
+            2_000,
+            0x9abc_def0,
+            None,
+            None,
+        );
+        assert_eq!(store.active_copy_id(), None);
+    }
 
     /// Invariant: a move that fails leaves browsing exactly where it was.
     ///

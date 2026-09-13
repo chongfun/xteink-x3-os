@@ -707,6 +707,26 @@ where
             esp_println::println!(
                 "upload: an install is unfinished; refusing changes until it clears"
             );
+        } else {
+            // The library's intent last, once the filesystem has decided
+            // what the destination holds.
+            match upload_store::replace::recover(root) {
+                Ok(upload_store::replace::Recovery::Nothing) => {}
+                Ok(upload_store::replace::Recovery::Settled(landed)) => {
+                    esp_println::println!("upload: settled a replacement in flight ({:?})", landed);
+                }
+                Ok(upload_store::replace::Recovery::Refused) => {
+                    esp_println::println!(
+                        "upload: a replacement is unresolved; refusing changes until it clears"
+                    );
+                }
+                Err(fault) => {
+                    esp_println::println!(
+                        "upload: library ledger {:?}; refusing changes until it clears",
+                        fault
+                    );
+                }
+            }
         }
     }
 
@@ -894,11 +914,19 @@ where
     if upload_store::reclaim::recover(root, Some(books)).is_err() {
         return false;
     }
-    if journal_is_clear(root) {
-        return true;
+    if !journal_is_clear(root) {
+        upload_store::install::recover_installs(root, books);
+        if !journal_is_clear(root) {
+            return false;
+        }
     }
-    upload_store::install::recover_installs(root, books);
-    journal_is_clear(root)
+    // Then the library's own intent, which can outlive both journals. A
+    // replacement that will not resolve owns its place, and nothing else
+    // may change the shelf beside it.
+    matches!(
+        upload_store::replace::recover(root),
+        Ok(upload_store::replace::Recovery::Nothing | upload_store::replace::Recovery::Settled(_))
+    )
 }
 
 /// A journal with nothing left to replay. A card that will not answer is not
@@ -1060,7 +1088,8 @@ where
     // install closes the file first: a book the card has not finished
     // writing is never published. From the moment the intent is durable the
     // swap completes here or at the next mount, never half way.
-    match staged.install(root, books) {
+    let rng = esp_hal::rng::Rng::new();
+    match staged.install(root, books, &mut || rng.random()) {
         Ok(landed) => {
             // Free here and expensive later: the bytes were hashed as they
             // streamed. Best-effort and outside the transaction, so a card
