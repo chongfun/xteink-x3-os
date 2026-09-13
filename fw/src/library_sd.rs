@@ -316,7 +316,7 @@ where
                     };
                 }
             }
-            let (had_intent, complete) = match upload_store::install::read_intent(root) {
+            let (mut had_intent, complete) = match upload_store::install::read_intent(root) {
                 Ok(IntentState::Absent) => (false, true),
                 // Nothing to replay, but something was there — and whatever
                 // it was may have moved the shelf before it went. Reclaim it
@@ -329,25 +329,50 @@ where
                 Err(_) => (true, false),
             };
             // The library transaction does not live on the shelf. It stands
-            // in /READER and can name a copy at the card root, so a scan let
-            // through here would age the record of a copy whose identity is
-            // still in flight. Nothing can resolve it without a shelf to read
-            // the landing from, so a standing intent only refuses.
-            let settled = match upload_store::replace::read(root) {
-                Ok(None) => true,
-                Ok(Some(_)) => {
-                    esp_println::println!(
-                        "sd: a replacement stands and there is no shelf; \
-                         not rebuilding the catalog"
-                    );
-                    false
+            // in /READER and can name a copy at the card root, which is still
+            // there to read a landing from, so this resolves what it can and
+            // refuses the rest rather than refusing everything.
+            let settled = if complete {
+                match upload_store::replace::recover(root) {
+                    Ok(upload_store::replace::Recovery::Nothing) => true,
+                    Ok(upload_store::replace::Recovery::Settled(landed)) => {
+                        esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
+                        had_intent = true;
+                        true
+                    }
+                    Ok(upload_store::replace::Recovery::Refused) => {
+                        esp_println::println!(
+                            "sd: a replacement is unresolved; not rebuilding the catalog"
+                        );
+                        false
+                    }
+                    Err(fault) => {
+                        esp_println::println!(
+                            "sd: library ledger {:?}; not rebuilding the catalog",
+                            fault
+                        );
+                        false
+                    }
                 }
-                Err(fault) => {
-                    esp_println::println!(
-                        "sd: library ledger {:?}; not rebuilding the catalog",
-                        fault
-                    );
-                    false
+            } else {
+                // Same order as the shelf-present path: read it, do not
+                // resolve it, while the filesystem transaction is unsettled.
+                match upload_store::replace::read(root) {
+                    Ok(None) => true,
+                    Ok(Some(_)) => {
+                        esp_println::println!(
+                            "sd: a replacement stands over an unfinished install; \
+                             not rebuilding the catalog"
+                        );
+                        false
+                    }
+                    Err(fault) => {
+                        esp_println::println!(
+                            "sd: library ledger {:?}; not rebuilding the catalog",
+                            fault
+                        );
+                        false
+                    }
                 }
             };
             return Reconciled {

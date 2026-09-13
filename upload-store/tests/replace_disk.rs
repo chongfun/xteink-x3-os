@@ -278,8 +278,13 @@ fn shelf_bytes(root: &Dir<'_>, name: &str) -> Option<Vec<u8>> {
 /// Overwrite what the shelf holds under `name`, as a computer would while
 /// the card was in it.
 fn overwrite_shelf(root: &Dir<'_>, name: &str, bytes: &[u8]) {
+    overwrite_at(root, BookRoot::Library, name, bytes);
+}
+
+/// The same, at either root: a loose book answers to the card root.
+fn overwrite_at(root: &Dir<'_>, at: BookRoot, name: &str, bytes: &[u8]) {
     let path = LibraryPath::parse(name).unwrap();
-    library::with_book_at(root, BookRoot::Library, &path, |dir, alias| {
+    library::with_book_at(root, at, &path, |dir, alias| {
         let mut alias_text = heapless::String::<12>::new();
         use core::fmt::Write as _;
         write!(alias_text, "{}", alias).unwrap();
@@ -910,9 +915,10 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
 /// A card with no shelf still has a library transaction to answer for.
 ///
 /// The intent stands in /READER, not on the shelf, and it can name a copy at
-/// the card root. A mount that reads only the install journal sees nothing.
+/// the card root. A mount that reads only the install journal sees nothing,
+/// and one that refuses on sight leaves a resolvable intent standing.
 #[test]
-fn a_standing_intent_is_readable_on_a_card_with_no_shelf() {
+fn a_card_root_replacement_is_answered_on_a_card_with_no_shelf() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let volume = mgr.open_volume(VolumeIdx(0)).expect("open volume");
@@ -963,6 +969,27 @@ fn a_standing_intent_is_readable_on_a_card_with_no_shelf() {
     assert!(
         replace::read(&root).expect("the journal reads").is_some(),
         "so the library intent is the only thing that says one is"
+    );
+
+    // The copy it names is at the card root, which reads without a shelf, so
+    // the landing can be established and the intent answered rather than
+    // parked.
+    overwrite_at(&root, BookRoot::CardRoot, LOOSE, &new);
+    assert_eq!(
+        replace::recover(&root),
+        Ok(Recovery::Settled(Landing::New)),
+        "the new bytes at the place are the new landing"
+    );
+    assert_eq!(
+        replace::read(&root).expect("the journal reads"),
+        None,
+        "and the intent clears"
+    );
+    let (locator, size, source) = record_by_id(&root, id).expect("the record stands");
+    assert_eq!((locator.as_str(), size), (LOOSE, new.len() as u32));
+    assert!(
+        digest_agrees(source, &new),
+        "under the id it had, carrying the new bytes"
     );
 }
 
